@@ -1,0 +1,55 @@
+name: Validate CadQuery iterable-edge tests
+
+on:
+  push:
+    branches:
+      - validate-cadquery-candidate-20261008
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMBA_NUM_THREADS: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: CadQuery/cadquery
+          ref: 9a6a705fe73ae94300974a3c668719f907b6353f
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.11"
+      - name: Install native runtime libraries
+        run: |
+          set -euo pipefail
+          test "$(git -C validation rev-parse HEAD)" = "$GITHUB_SHA"
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libgl1 libegl1 libxrender1 libxext6
+          python --version
+          uname -a
+          df -h .
+      - name: Install declared dependencies and run complete candidate
+        working-directory: source
+        run: python ../validation/cadquery-validation-2104/candidate.py
+      - name: Record final source state
+        if: ${{ !cancelled() }}
+        working-directory: source
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          git status --porcelain=v1 --untracked-files=all
+          git diff --check
+          df -h .
