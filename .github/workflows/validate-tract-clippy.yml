@@ -1,0 +1,123 @@
+name: Qualify unchanged Tract workspace
+
+on:
+  push:
+    branches:
+      - validate-tract-clippy-20261008
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+      RAYON_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: sonos/tract
+          ref: 4cc53e7f69df21ea0004076c16db5c033486e504
+          persist-credentials: false
+      - name: Verify exact upstream source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 4cc53e7f69df21ea0004076c16db5c033486e504
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+          import subprocess
+          paths = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')[:-1]
+          digest = hashlib.sha256()
+          for name in paths:
+              digest.update(name.encode() + b'\0' + pathlib.Path(name).read_bytes() + b'\0')
+          if len(paths) != 2222 or digest.hexdigest() != 'ad3d9d32f6214c2a4c351214b206e2bf1002f79cf7c0bc95ec54cdeb00b4b9bb':
+              raise RuntimeError(('Unexpected upstream source', len(paths), digest.hexdigest()))
+          if hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest() != 'e1320365bd95176505a770bfd188ab571ac23f1aa699c003afe2bdb104b407d5':
+              raise RuntimeError('Tracked Cargo.lock changed')
+          print('Exact upstream source and tracked lock verified', len(paths), digest.hexdigest())
+          PY
+          git ls-files -z | xargs -0 shasum -a 256 > "$RUNNER_TEMP/tract-source.sha256"
+          cat Cargo.lock
+      - name: Configure existing native tools
+        run: |
+          set -euo pipefail
+          clang_path="$(xcrun --find clang)"
+          clangxx_path="$(xcrun --find clang++)"
+          sdk_path="$(xcrun --show-sdk-path)"
+          libclang_path="$(dirname "$clang_path")/../lib"
+          test -f "$libclang_path/libclang.dylib"
+          printf 'CC=%s\nCXX=%s\nSDKROOT=%s\nLIBCLANG_PATH=%s\n' "$clang_path" "$clangxx_path" "$sdk_path" "$libclang_path" >> "$GITHUB_ENV"
+          "$clang_path" --version
+          sw_vers
+          uname -a
+          df -h .
+          rustup toolchain install 1.91.0 --profile minimal --component clippy
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup run 1.91.0 rustc -Vv
+          rustup run 1.91.0 cargo clippy -V
+          rustup run stable rustfmt --version
+          python3 --version
+      - name: Fetch locked dependencies
+        run: |
+          set -euo pipefail
+          rustup run 1.91.0 cargo fetch --locked
+          shasum -a 256 --check "$RUNNER_TEMP/tract-source.sha256" > "$RUNNER_TEMP/tract-after-fetch.log"
+      - name: Qualify complete workspace with Clippy
+        run: |
+          set -euo pipefail
+          set +e
+          rustup run 1.91.0 cargo clippy --workspace --locked --offline --jobs 1 --message-format=json 2>&1 | tee "$RUNNER_TEMP/tract-clippy.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          messages = []
+          artifacts = []
+          finished = False
+          for line in (pathlib.Path(os.environ['RUNNER_TEMP']) / 'tract-clippy.log').read_text().splitlines():
+              try:
+                  entry = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if entry.get('reason') == 'compiler-message' and entry['message']['level'] in ('warning', 'error'):
+                  messages.append(entry)
+              if entry.get('reason') == 'compiler-artifact':
+                  artifacts.append({'package_id': entry['package_id'], 'target': entry['target']['name'], 'src_path': entry['target']['src_path'], 'fresh': entry['fresh']})
+              if entry.get('reason') == 'build-finished':
+                  finished = entry['success']
+          print('Compiler diagnostics', json.dumps(messages))
+          print('Compiler artifacts', json.dumps(artifacts))
+          print('Workspace completion', finished, 'artifact count', len(artifacts))
+          if not finished or not artifacts or not {'tract_core', 'tract_linalg'} <= {entry['target'] for entry in artifacts}:
+              raise RuntimeError('Nonempty successful workspace compilation was not established')
+          if messages:
+              raise RuntimeError('Baseline workspace diagnostics require a prerequisite')
+          PY
+          test "${pipeline_status[0]}" -eq 0
+          test "${pipeline_status[1]}" -eq 0
+      - name: Check repository-selected stable formatting
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+      - name: Verify final unchanged source and lock
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          shasum -a 256 --check "$RUNNER_TEMP/tract-source.sha256" > "$RUNNER_TEMP/tract-final-source.log"
+          test "$(git rev-parse HEAD)" = 4cc53e7f69df21ea0004076c16db5c033486e504
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo 'All 2222 tracked files and Cargo.lock remain unchanged.'
