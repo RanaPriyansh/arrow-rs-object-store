@@ -1,0 +1,73 @@
+name: Validate Tract workspace and one-thread dispatch
+
+on:
+  push:
+    branches:
+      - validate-tract-repair-20261008
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+      RAYON_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: sonos/tract
+          ref: 4cc53e7f69df21ea0004076c16db5c033486e504
+          path: source
+          persist-credentials: false
+      - name: Configure existing native tools
+        run: |
+          set -euo pipefail
+          test "$(git -C ../validation rev-parse HEAD)" = "$GITHUB_SHA"
+          clang_path="$(xcrun --find clang)"
+          clangxx_path="$(xcrun --find clang++)"
+          sdk_path="$(xcrun --show-sdk-path)"
+          libclang_path="$(dirname "$clang_path")/../lib"
+          test -f "$libclang_path/libclang.dylib"
+          printf 'CC=%s\nCXX=%s\nSDKROOT=%s\nLIBCLANG_PATH=%s\nCARGO_TARGET_DIR=%s\n' "$clang_path" "$clangxx_path" "$sdk_path" "$libclang_path" "$RUNNER_TEMP/tract-target" >> "$GITHUB_ENV"
+          "$clang_path" --version
+          sw_vers
+          uname -a
+          df -h .
+          rustup toolchain install 1.91.0 --profile minimal --component clippy --component rustfmt
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup run 1.91.0 rustc -Vv
+          rustup run 1.91.0 cargo clippy -V
+          rustup run 1.91.0 rustfmt --version
+          rustup run stable rustfmt --version
+          python3 --version
+      - name: Fetch locked dependencies
+        run: |
+          set -euo pipefail
+          rustup run 1.91.0 cargo fetch --locked
+      - name: Validate prerequisite and dispatcher
+        run: |
+          set -euo pipefail
+          python3 ../validation/tract-validation-2894/validate.py
+      - name: Record final source after a failed validation
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          git status --porcelain=v1 --untracked-files=all
+          shasum -a 256 Cargo.lock
+          git diff --check
+          df -h .

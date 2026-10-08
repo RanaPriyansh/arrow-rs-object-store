@@ -1,0 +1,13 @@
+{
+  "baseline": "ad3d9d32f6214c2a4c351214b206e2bf1002f79cf7c0bc95ec54cdeb00b4b9bb",
+  "candidate": "3d22790f54b49602e1ab94e9115c2eb070687ff2ca2977d59db69577f7e18386",
+  "payload_sha256": {
+    "baseline-c-bindings.json": "375bc68a531f3d781384488ff53541d2cdf2bcbb7d7d1c0cd2984d71a24d4edf",
+    "baseline-tests.patch": "51e6356f8cf89bbcb4bdf508ebcff3bd9731186ddf3ad9d6f69cb0acb6b778ed",
+    "dispatcher.patch": "3b091b8863c175474493e162eeadeb79657ec18b96df92f31626a6ea26e2d0ad",
+    "prerequisite.patch": "e97a8a1a56fa8525ddb8d88f0a0e52124bffaadc83c0a43813e2c991e151f5f5",
+    "validate.py": "3016cceedb1c1da65e4f379cff46e8a674299d95fd66ff9ce56345dd2e99fbfd"
+  },
+  "prerequisite": "5d0f5e6bc6d0bba231ccc0c18164ed2bf4386533abd06b59349ee1666236bec0",
+  "test_only_baseline": "2c94a1d0ee53f575f9812b72d70b4397b7d4b6a4b4510e143226aa6c8833b57f"
+}

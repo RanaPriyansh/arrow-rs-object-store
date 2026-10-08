@@ -1,0 +1,274 @@
+diff --git a/harness/nnef-test-cases/parallel-matmul/runme.sh b/harness/nnef-test-cases/parallel-matmul/runme.sh
+index be687e36d..c9b205aba 100755
+--- a/harness/nnef-test-cases/parallel-matmul/runme.sh
++++ b/harness/nnef-test-cases/parallel-matmul/runme.sh
+@@ -23,8 +23,8 @@ $TRACT_RUN . -O run --allow-random-input --save-outputs ref.npz
+ # `--threads` bails; drive this case with a multithread-mm TRACT_RUN (the plan's
+ # verification step does) to exercise the parallel leg. We warn rather than skip
+ # silently so a serial-only run is never mistaken for threaded coverage.
+-if $TRACT_RUN --threads 2 . dump -q >/dev/null 2>&1; then
+-    for threads in 2 3 8; do
++if $TRACT_RUN --threads 1 . dump -q >/dev/null 2>&1; then
++    for threads in 1 2 3 8; do
+         $TRACT_RUN --threads $threads . -O run \
+             --allow-random-input --assert-output-bundle ref.npz --approx exact
+     done
+diff --git a/linalg/src/frame/mmm/mod.rs b/linalg/src/frame/mmm/mod.rs
+index 03342fe92..7898f6c1c 100644
+--- a/linalg/src/frame/mmm/mod.rs
++++ b/linalg/src/frame/mmm/mod.rs
+@@ -861,10 +861,10 @@ fn chunk_grid(
+ /// `pool`:
+ ///   * `Some(p)` with `p.current_num_threads() > 1` → scoped via `p.install`
+ ///     (native, custom pool path).
+-///   * `Some(p)` with single-thread pool, or `None` → dispatched via
+-///     `into_par_iter` directly, which uses rayon's GLOBAL pool. This is
+-///     the only working path on `wasm32-unknown-unknown` via
+-///     `wasm_bindgen_rayon::init_thread_pool`.
++///   * `Some(p)` with a single-thread pool → one inline callback on the caller.
++///   * `None` → dispatched via `into_par_iter` directly, which uses rayon's
++///     ambient pool. This is the only working path on `wasm32-unknown-unknown`
++///     via `wasm_bindgen_rayon::init_thread_pool`.
+ #[cfg(feature = "multithread-mm")]
+ #[allow(clippy::too_many_arguments)]
+ unsafe fn chunked_dispatch_rayon<F>(
+@@ -889,7 +889,6 @@ where
+         // on the calling thread. Closure handles its own TLS scope.
+         return run_chunk(0, n_panels_m, 0, n_panels_n, 1);
+     }
+-    let use_global = pool.is_none_or(|p| p.current_num_threads() <= 1);
+     let cpt = chunks_per_thread(packed_operand_bytes(n_panels_m, n_panels_n, mr, nr, k, elem));
+     let body = || {
+         let nth = rayon::current_num_threads();
+@@ -907,13 +906,24 @@ where
+             run_chunk(ia_start, ia_end, ib_start, ib_end, concurrency)
+         })
+     };
+-    if use_global { body() } else { pool.unwrap().install(body) }
++    match pool {
++        Some(pool) if pool.current_num_threads() <= 1 => run_chunk(0, n_panels_m, 0, n_panels_n, 1),
++        Some(pool) => pool.install(body),
++        None => body(),
++    }
+ }
+ 
+ #[cfg(test)]
+ mod blocked_walk_tests {
+     use super::*;
+     use std::collections::HashSet;
++    #[cfg(feature = "multithread-mm")]
++    use std::sync::{Arc, Mutex};
++    #[cfg(feature = "multithread-mm")]
++    use std::thread::{self, ThreadId};
++
++    #[cfg(feature = "multithread-mm")]
++    type DispatchObservation = (usize, usize, usize, usize, usize, ThreadId);
+ 
+     fn collect(
+         m: Range<usize>,
+@@ -1210,4 +1220,205 @@ mod blocked_walk_tests {
+             }
+         }
+     }
++
++    #[cfg(feature = "multithread-mm")]
++    #[test]
++    fn dispatch_controls() {
++        use rayon::ThreadPoolBuilder;
++
++        let ambient = ThreadPoolBuilder::new()
++            .num_threads(2)
++            .thread_name(|index| format!("mmm-control-{index}"))
++            .build()
++            .unwrap();
++        let supplied = ThreadPoolBuilder::new()
++            .num_threads(2)
++            .thread_name(|index| format!("mmm-supplied-{index}"))
++            .build()
++            .unwrap();
++        let serial = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
++        let run = |pool: Option<&rayon::ThreadPool>,
++                   m,
++                   n,
++                   callback: &(
++                        dyn Fn(usize, usize, usize, usize, usize) -> TractResult<()> + Sync
++                    )| unsafe {
++            chunked_dispatch_rayon(pool, m, n, 1, 1, 1, 1, callback)
++        };
++
++        let observations = Arc::new(Mutex::new(Vec::<DispatchObservation>::new()));
++        let captured = observations.clone();
++        ambient
++            .install(|| {
++                run(Some(&supplied), 16, 16, &|a, b, c, d, e| {
++                    let current = thread::current();
++                    assert!(current.name().unwrap_or_default().starts_with("mmm-supplied-"));
++                    captured.lock().unwrap().push((a, b, c, d, e, thread::current().id()));
++                    Ok(())
++                })
++            })
++            .unwrap();
++        let observations = observations.lock().unwrap().clone();
++        let mut tiles = HashSet::new();
++        for (a, b, c, d, _, _) in observations {
++            for ia in a..b {
++                for ib in c..d {
++                    assert!(tiles.insert((ia, ib)));
++                }
++            }
++        }
++        assert_eq!(tiles.len(), 16 * 16);
++
++        let observations = Arc::new(Mutex::new(Vec::<DispatchObservation>::new()));
++        let captured = observations.clone();
++        ambient
++            .install(|| {
++                run(None, 16, 16, &|a, b, c, d, e| {
++                    let current = thread::current();
++                    assert!(current.name().unwrap_or_default().starts_with("mmm-control-"));
++                    assert_eq!(e, 2);
++                    captured.lock().unwrap().push((a, b, c, d, e, current.id()));
++                    Ok(())
++                })
++            })
++            .unwrap();
++        let observations = observations.lock().unwrap().clone();
++        let mut tiles = HashSet::new();
++        for (a, b, c, d, _, _) in observations {
++            for ia in a..b {
++                for ib in c..d {
++                    assert!(tiles.insert((ia, ib)));
++                }
++            }
++        }
++        assert_eq!(tiles.len(), 16 * 16);
++
++        let calls = Arc::new(Mutex::new(0));
++        let captured = calls.clone();
++        run(Some(&serial), 0, 16, &|_, _, _, _, _| {
++            *captured.lock().unwrap() += 1;
++            Ok(())
++        })
++        .unwrap();
++        assert_eq!(*calls.lock().unwrap(), 0);
++
++        let calls = Arc::new(Mutex::new(0));
++        let captured = calls.clone();
++        run(Some(&serial), 16, 0, &|_, _, _, _, _| {
++            *captured.lock().unwrap() += 1;
++            Ok(())
++        })
++        .unwrap();
++        assert_eq!(*calls.lock().unwrap(), 0);
++
++        let observations = Arc::new(Mutex::new(Vec::<DispatchObservation>::new()));
++        let captured = observations.clone();
++        let (caller, result) = ambient.install(|| {
++            let caller = thread::current().id();
++            let result = run(Some(&serial), 4, 4, &|a, b, c, d, e| {
++                captured.lock().unwrap().push((a, b, c, d, e, thread::current().id()));
++                Ok(())
++            });
++            (caller, result)
++        });
++        result.unwrap();
++        let observations = observations.lock().unwrap().clone();
++        assert_eq!(observations.len(), 1);
++        assert_eq!(observations[0].0..observations[0].1, 0..4);
++        assert_eq!(observations[0].2..observations[0].3, 0..4);
++        assert_eq!(observations[0].4, 1);
++        assert_eq!(observations[0].5, caller);
++
++        let calls = Arc::new(Mutex::new(0));
++        let captured = calls.clone();
++        let result = run(Some(&serial), 4, 4, &|_, _, _, _, _| {
++            *captured.lock().unwrap() += 1;
++            Err(tract_data::internal::anyhow!("dispatch control error"))
++        });
++        assert!(result.is_err());
++        assert_eq!(*calls.lock().unwrap(), 1);
++    }
++
++    #[cfg(feature = "multithread-mm")]
++    #[test]
++    fn dispatch_controls_and_one_thread_pool_regression() {
++        use rayon::ThreadPoolBuilder;
++
++        let ambient = ThreadPoolBuilder::new()
++            .num_threads(2)
++            .thread_name(|index| format!("mmm-ambient-{index}"))
++            .build()
++            .unwrap();
++        let serial = ThreadPoolBuilder::new()
++            .num_threads(1)
++            .thread_name(|index| format!("mmm-serial-{index}"))
++            .build()
++            .unwrap();
++        let observations = Arc::new(Mutex::new(Vec::<DispatchObservation>::new()));
++        let captured = observations.clone();
++        let (caller, result) = ambient.install(|| {
++            let caller = thread::current().id();
++            let result = unsafe {
++                chunked_dispatch_rayon(
++                    Some(&serial),
++                    16,
++                    16,
++                    1,
++                    1,
++                    1,
++                    1,
++                    |ia_start, ia_end, ib_start, ib_end, concurrency| {
++                        captured.lock().unwrap().push((
++                            ia_start,
++                            ia_end,
++                            ib_start,
++                            ib_end,
++                            concurrency,
++                            thread::current().id(),
++                        ));
++                        Ok(())
++                    },
++                )
++            };
++            (caller, result)
++        });
++        result.unwrap();
++        let observations = observations.lock().unwrap().clone();
++        assert_eq!(observations.len(), 1);
++        assert_eq!(observations[0].0..observations[0].1, 0..16);
++        assert_eq!(observations[0].2..observations[0].3, 0..16);
++        assert_eq!(observations[0].4, 1);
++        assert_eq!(observations[0].5, caller);
++
++        let observations = Arc::new(Mutex::new(Vec::<DispatchObservation>::new()));
++        let captured = observations.clone();
++        let (caller, result) = ambient.install(|| {
++            let caller = thread::current().id();
++            let result = unsafe {
++                chunked_dispatch_rayon(
++                    Some(&serial),
++                    16,
++                    16,
++                    1,
++                    1,
++                    1,
++                    1,
++                    |ia_start, ia_end, ib_start, ib_end, concurrency| {
++                        captured.lock().unwrap().push((
++                            ia_start,
++                            ia_end,
++                            ib_start,
++                            ib_end,
++                            concurrency,
++                            thread::current().id(),
++                        ));
++                        Err(tract_data::internal::anyhow!("dispatch regression error"))
++                    },
++                )
++            };
++            (caller, result)
++        });
++        assert_eq!(result.unwrap_err().to_string(), "dispatch regression error");
++        assert_eq!(*observations.lock().unwrap(), vec![(0, 16, 0, 16, 1, caller)]);
++    }
+ }

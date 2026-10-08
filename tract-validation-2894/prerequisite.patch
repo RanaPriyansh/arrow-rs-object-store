@@ -1,0 +1,127 @@
+diff --git a/api/proxy/sys/build.rs b/api/proxy/sys/build.rs
+index 174b2d1db..b70edb27f 100644
+--- a/api/proxy/sys/build.rs
++++ b/api/proxy/sys/build.rs
+@@ -11,6 +11,7 @@ fn main() {
+ 
+     let bindings = bindgen::Builder::default()
+         .header("tract.h")
++        .allowlist_file(r"(^|.*[/\\])tract\.h")
+         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+         .generate()
+         .expect("Unable to generate bindings");
+diff --git a/cli/src/hwbench.rs b/cli/src/hwbench.rs
+index f899c2514..840c0c1a1 100644
+--- a/cli/src/hwbench.rs
++++ b/cli/src/hwbench.rs
+@@ -205,7 +205,7 @@ pub(crate) fn handle(matches: &clap::ArgMatches) -> TractResult<()> {
+             params.shapes.iter().map(|s| parse_shape(s)).flatten_ok().collect::<TractResult<_>>()?
+         };
+         for (dt, m, k, n, gated) in requests {
+-            let shape = bench_shape(dt, m, k, n, gated, false, false, params.include_generic)?;
++            let shape = bench_shape(dt, (m, k, n), gated, false, false, params.include_generic)?;
+             if !params.json {
+                 print_shape(&shape);
+             }
+@@ -360,7 +360,7 @@ pub(crate) fn kernel_times(
+     n: usize,
+     cold: bool,
+ ) -> TractResult<Vec<(String, f64)>> {
+-    Ok(bench_shape(dt, m, k, n, false, true, cold, false)?
++    Ok(bench_shape(dt, (m, k, n), false, true, cold, false)?
+         .kernels
+         .into_iter()
+         .map(|k| (k.kernel, k.flop_per_s))
+@@ -387,9 +387,7 @@ fn llc_bytes() -> usize {
+ 
+ fn bench_shape(
+     dt: DatumType,
+-    m: usize,
+-    k: usize,
+-    n: usize,
++    (m, k, n): (usize, usize, usize),
+     gated: bool,
+     fast: bool,
+     cold: bool,
+diff --git a/linalg/src/arm32/mod.rs b/linalg/src/arm32/mod.rs
+index 9309b5778..6a4591721 100644
+--- a/linalg/src/arm32/mod.rs
++++ b/linalg/src/arm32/mod.rs
+@@ -47,15 +47,15 @@ fn neon_mmv_f32(suitable: &[Suitable], query: &Query) -> Option<&'static str> {
+             Some(m) if m < 32 => {
+                 cortex_a7_mmv_linear::linear_model().preferred(suitable, Some(m), query.k, Some(1))
+             }
+-            _ => Some(&armv7neon::armv7neon_mmm_f32_32x1_cortexa7.name.as_str()),
++            _ => Some(armv7neon::armv7neon_mmm_f32_32x1_cortexa7.name.as_str()),
+         },
+         0xc09 => match query.m {
+             Some(m) if m < 32 => {
+                 cortex_a9_mmv_linear::linear_model().preferred(suitable, Some(m), query.k, Some(1))
+             }
+-            _ => Some(&armv7neon::armv7neon_mmm_f32_32x1_cortexa9.name.as_str()),
++            _ => Some(armv7neon::armv7neon_mmm_f32_32x1_cortexa9.name.as_str()),
+         },
+-        _ => Some(&armv7neon::armv7neon_mmm_f32_32x1_generic.name.as_str()),
++        _ => Some(armv7neon::armv7neon_mmm_f32_32x1_generic.name.as_str()),
+     }
+ }
+ 
+@@ -80,8 +80,8 @@ fn preferred(
+     match (dt, query.n) {
+         (DatumType::F32, Some(1)) => neon_mmv_f32(suitable, query),
+         (DatumType::F32, _) => neon_mmm_f32(suitable, query),
+-        (DatumType::I32, Some(1)) => Some(&armv7neon::armv7neon_mmm_i32_32x1.name.as_str()),
+-        (DatumType::I32, _) => Some(&armv7neon::armv7neon_mmm_i32_8x4.name.as_str()),
++        (DatumType::I32, Some(1)) => Some(armv7neon::armv7neon_mmm_i32_32x1.name.as_str()),
++        (DatumType::I32, _) => Some(armv7neon::armv7neon_mmm_i32_8x4.name.as_str()),
+         _ => None,
+     }
+ }
+diff --git a/linalg/src/x86_64/mmm.rs b/linalg/src/x86_64/mmm.rs
+index 3818885d2..6c7d891dc 100644
+--- a/linalg/src/x86_64/mmm.rs
++++ b/linalg/src/x86_64/mmm.rs
+@@ -424,7 +424,7 @@ fn avx2_preferred(
+ ) -> Option<&'static str> {
+     match (dt, query.n) {
+         (DatumType::I32, Some(1)) => None,
+-        (DatumType::I32, _) => Some(&mmm::avx2_mmm_i32_8x8.name.as_str()),
++        (DatumType::I32, _) => Some(mmm::avx2_mmm_i32_8x8.name.as_str()),
+         _ => None,
+     }
+ }
+diff --git a/metal/src/kernels/gdn_recurrent.rs b/metal/src/kernels/gdn_recurrent.rs
+index 82d370b20..604afdff9 100644
+--- a/metal/src/kernels/gdn_recurrent.rs
++++ b/metal/src/kernels/gdn_recurrent.rs
+@@ -206,7 +206,7 @@ fn dispatch_chunked(
+     }
+ 
+     let prep = stream.load_pipeline(LibraryName::GdnRecurrent, "gdn_chunk_prepare_f16")?;
+-    let tg_width = (prep.max_total_threads_per_threadgroup() as u64).min(256);
++    let tg_width = prep.max_total_threads_per_threadgroup().min(256);
+     let command_buffer = stream.command_buffer();
+     command_buffer.encode(|encoder| {
+         encoder.set_compute_pipeline_state(&prep);
+@@ -244,7 +244,7 @@ fn dispatch_chunked(
+     let scan_name = if f16_state { "gdn_chunk_scan_f16_state" } else { "gdn_chunk_scan_f32_state" };
+     let scan = stream.load_pipeline(LibraryName::GdnRecurrent, scan_name)?;
+     let col_blocks = width.div_ceil(GDN_COL_BLOCK);
+-    let tg_width = (scan.max_total_threads_per_threadgroup() as u64).min(256);
++    let tg_width = scan.max_total_threads_per_threadgroup().min(256);
+     let command_buffer = stream.command_buffer();
+     command_buffer.encode(|encoder| {
+         encoder.set_compute_pipeline_state(&scan);
+diff --git a/transformers/src/ops/routed_matmul.rs b/transformers/src/ops/routed_matmul.rs
+index 4cd84292f..e86e6e6ba 100644
+--- a/transformers/src/ops/routed_matmul.rs
++++ b/transformers/src/ops/routed_matmul.rs
+@@ -316,7 +316,7 @@ fn select_block_quant_left_mmm(
+             let Some(b_format) = b.downcast_ref::<PackedFormat>() else {
+                 continue;
+             };
+-            if !b_format.precursor().as_dt().is_some_and(|dt| dt == f32::datum_type()) {
++            if b_format.precursor().as_dt() != Some(f32::datum_type()) {
+                 continue;
+             }
+             if !k_dim.is_multiple_of(a_format.k_alignment())
