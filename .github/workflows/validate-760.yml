@@ -1,0 +1,127 @@
+name: Validate external crypto provider
+
+on:
+  push:
+    branches:
+      - validate-crypto-provider-760-20261008
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_TERM_COLOR: never
+      RUST_TEST_THREADS: "1"
+      RAYON_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: c4df97251dfefcb44ed0a198c92b149f65d1d035
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source and tools
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = c4df97251dfefcb44ed0a198c92b149f65d1d035
+          test -z "$(git status --porcelain)"
+          git diff 279572ea60f3a7a6e5237e066a6f4a35eee611e0 HEAD --check
+          git diff --name-only 279572ea60f3a7a6e5237e066a6f4a35eee611e0 HEAD
+          printf '%s\n' \
+            '9a742d66e29879b04acbc362a2f4d92799bd8119c309c3d547056fb98860a648  .github/workflows/ci.yml' \
+            '764a9125a0c10cc6440d70895dd2921062e5e0472e4dde71d933b0a8a0374188  tests/crypto-provider/Cargo.toml' \
+            '6f478af5f692bf6f43c1e8ff3d6bed382a667e36d2890461aaa64638ea060399  tests/crypto-provider/tests/aws.rs' | sha256sum --check
+          git ls-files -z | xargs -0 sha256sum > "$RUNNER_TEMP/source.sha256"
+          rustup toolchain install 1.97.0 --profile minimal --component clippy --component rustfmt
+          rustc --version --verbose
+          cargo --version
+          uname -a
+          df -h .
+          curl --fail --location --retry 2 --output "$RUNNER_TEMP/typos.tar.gz" https://github.com/crate-ci/typos/releases/download/v1.37.0/typos-v1.37.0-x86_64-unknown-linux-musl.tar.gz
+          echo '7333d1082ac005910e3fc31b8f0c01aabf9463f2b793dc5851c73fcf861b8043  '"$RUNNER_TEMP/typos.tar.gz" | sha256sum --check
+          mkdir "$RUNNER_TEMP/typos"
+          tar -xzf "$RUNNER_TEMP/typos.tar.gz" -C "$RUNNER_TEMP/typos" ./typos
+          "$RUNNER_TEMP/typos/typos" --version
+      - name: Resolve complete dependency graphs
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 --all-features --features reqwest/native-tls,reqwest/rustls-no-provider,aws-lc-rs/aws-lc-sys > "$RUNNER_TEMP/root-metadata.json"
+          cargo generate-lockfile --manifest-path tests/crypto-provider/Cargo.toml
+          cargo metadata --locked --format-version 1 --all-features --manifest-path tests/crypto-provider/Cargo.toml > "$RUNNER_TEMP/fixture-metadata.json"
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path tests/crypto-provider/Cargo.toml
+          sha256sum Cargo.lock tests/crypto-provider/Cargo.lock > "$RUNNER_TEMP/locks.sha256"
+          cat "$RUNNER_TEMP/locks.sha256"
+          cat Cargo.lock
+          cat tests/crypto-provider/Cargo.lock
+      - name: Test external provider configurations
+        run: |
+          set -euo pipefail
+          export CARGO_NET_OFFLINE=true
+          for variant in base bundled-ring default-aws; do
+            features=()
+            if [ "$variant" != base ]; then features=(--features "$variant"); fi
+            cargo test --locked --manifest-path tests/crypto-provider/Cargo.toml --test aws "${features[@]}" -- --list 2>&1 | tee "$RUNNER_TEMP/$variant-list.log"
+            cargo test --locked --manifest-path tests/crypto-provider/Cargo.toml --test aws "${features[@]}" -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/$variant-test.log"
+          done
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          logs = pathlib.Path(os.environ['RUNNER_TEMP'])
+          common = {'external_provider_known_vectors', 'custom_provider_signs_public_put', 'digest_finish_error_prevents_http', 'hmac_finish_error_prevents_http'}
+          for variant in ('base', 'bundled-ring', 'default-aws'):
+              expected = common | ({'aws_base_without_crypto_prevents_http'} if variant == 'base' else {'bundled_crypto_signs_public_put'})
+              names = re.findall(r'^(\w+): test$', (logs / f'{variant}-list.log').read_text(), re.MULTILINE)
+              if len(names) != 5 or set(names) != expected:
+                  raise RuntimeError((variant, 'unexpected test discovery', names))
+              result = (logs / f'{variant}-test.log').read_text()
+              if not re.search(r'test result: ok\. 5 passed; 0 failed; 0 ignored;', result):
+                  raise RuntimeError((variant, 'incorrect result count'))
+              for name in expected:
+                  if not re.search(r'^test ' + re.escape(name) + r' \.\.\. ok$', result, re.MULTILINE):
+                      raise RuntimeError((variant, 'missing passing test', name))
+              print(variant, '5 named tests discovered and passed', sorted(expected))
+          PY
+      - name: Test root default and Ring configurations
+        run: |
+          set -euo pipefail
+          export CARGO_NET_OFFLINE=true
+          cargo test --locked -- --test-threads=1
+          cargo test --locked --lib --tests --no-default-features --features fs,aws-base,azure-base,gcp-base,http-base,reqwest,reqwest/native-tls,ring -- --test-threads=1
+      - name: Check external provider with Clippy
+        run: |
+          set -euo pipefail
+          export CARGO_NET_OFFLINE=true
+          cargo clippy --locked --manifest-path tests/crypto-provider/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/crypto-provider/Cargo.toml --all-targets --features bundled-ring -- -D warnings
+          cargo clippy --locked --manifest-path tests/crypto-provider/Cargo.toml --all-targets --features default-aws -- -D warnings
+      - name: Check root crypto feature combinations
+        run: |
+          set -euo pipefail
+          export CARGO_NET_OFFLINE=true
+          cargo clippy --locked -- -D warnings
+          cargo clippy --locked --features aws -- -D warnings
+          cargo clippy --locked --no-default-features --features aws-base -- -D warnings
+          cargo clippy --locked --no-default-features --features aws-base,azure-base,gcp-base,http-base,reqwest,reqwest/rustls-no-provider,ring -- -D warnings
+          cargo clippy --locked --no-default-features --features aws-base,azure-base,gcp-base,http-base,reqwest,reqwest/rustls-no-provider -- -D warnings
+          cargo clippy --locked --no-default-features --features aws-base,azure-base,gcp-base,http-base,aws-lc-rs,aws-lc-rs/aws-lc-sys -- -D warnings
+          cargo clippy --locked --no-default-features --features aws-base,azure-base,gcp-base,http-base,ring -- -D warnings
+          cargo clippy --locked --no-default-features --features aws-base,azure-base,gcp-base,http-base -- -D warnings
+      - name: Check formatting, spelling, and source identity
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path tests/crypto-provider/Cargo.toml -- --check
+          "$RUNNER_TEMP/typos/typos" --force-exclude
+          sha256sum --check "$RUNNER_TEMP/locks.sha256"
+          sha256sum --check "$RUNNER_TEMP/source.sha256" > "$RUNNER_TEMP/source-check.log"
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
+          echo 'All required validation steps passed on the pinned source commit.'
