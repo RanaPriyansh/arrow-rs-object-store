@@ -118,8 +118,13 @@ def package_exports(conda, mamba, environment, env):
     failures = [capture(f"export-{name}", args, env) for name, args in exports]
     assert not any(failures)
     conda_json = json.loads((ARTIFACTS / "export-conda-list.stdout").read_text())
+    json.loads((ARTIFACTS / "export-environment-resolved.stdout").read_text())
     inspect_json = json.loads((ARTIFACTS / "export-pip-inspect.stdout").read_text())
-    conda_names = {record["name"].lower().replace("_", "-") for record in conda_json}
+    conda_names = {
+        record["name"].lower().replace("_", "-")
+        for record in conda_json
+        if record.get("channel") not in ("pypi", "") and record.get("subdir") != "pypi"
+    }
     pip_only = []
     for item in inspect_json.get("installed", []):
         name = item["metadata"]["name"].lower().replace("_", "-")
@@ -128,22 +133,36 @@ def package_exports(conda, mamba, environment, env):
         direct_url = item.get("direct_url", {})
         vcs = direct_url.get("vcs_info", {})
         if vcs.get("vcs") == "git":
-            pip_only.append(f"{name} @ {direct_url['url']}@{vcs['commit_id']}")
+            pip_only.append(f"{name} @ git+{direct_url['url']}@{vcs['commit_id']}")
         else:
             pip_only.append(f"{name}=={item['metadata']['version']}")
     (ARTIFACTS / "pip-only-requirements.txt").write_text("\n".join(sorted(pip_only)) + "\n")
     wheelhouse = ARTIFACTS / "wheels"
     wheelhouse.mkdir()
     assert capture("pip-wheel-build", [mamba, "run", "--prefix", environment, "python", "-m", "pip", "wheel", "--wheel-dir", wheelhouse, "--no-deps", "--requirement", ARTIFACTS / "pip-only-requirements.txt"], env) == 0
+    expected = {}
+    for item in inspect_json.get("installed", []):
+        name = item["metadata"]["name"].lower().replace("_", "-")
+        if name == "cadquery" or name in conda_names:
+            continue
+        expected[name] = item["metadata"]["version"]
+    actual = {}
+    for wheel in sorted(wheelhouse.glob("*.whl")):
+        with zipfile.ZipFile(wheel) as archive:
+            metadata = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+            fields = dict(line.split(": ", 1) for line in archive.read(metadata).decode().splitlines() if ": " in line)
+        key = fields["Name"].lower().replace("_", "-")
+        assert key not in actual
+        actual[key] = fields["Version"]
+    assert actual == expected
+    black_requirement = next(line for line in pip_only if line.startswith("black @ "))
+    assert black_requirement.startswith("black @ git+https://github.com/cadquery/black.git@")
     hashed = []
     for wheel in sorted(wheelhouse.glob("*.whl")):
         with zipfile.ZipFile(wheel) as archive:
             metadata = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
             fields = dict(line.split(": ", 1) for line in archive.read(metadata).decode().splitlines() if ": " in line)
         hashed.append(f"{fields['Name']}=={fields['Version']} --hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}")
-    expected_names = sorted(line.split("==", 1)[0].split(" @ ", 1)[0].lower().replace("_", "-") for line in pip_only if line)
-    actual_names = sorted(line.split("==", 1)[0].lower().replace("_", "-") for line in hashed)
-    assert actual_names == expected_names
     (ARTIFACTS / "pip-only-hashed-requirements.txt").write_text("\n".join(sorted(hashed)) + "\n")
 
 
@@ -153,6 +172,24 @@ def artifact_manifest():
         if path.is_file() and path.name != "artifact-manifest.json":
             manifest[str(path.relative_to(ARTIFACTS))] = hashlib.sha256(path.read_bytes()).hexdigest()
     (ARTIFACTS / "artifact-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def runtime_identity(mamba, environment, env):
+    commands = {
+        "conda_python": [mamba, "run", "--prefix", environment, "python", "--version"],
+        "mypy": [mamba, "run", "--prefix", environment, "mypy", "--version"],
+        "black": [mamba, "run", "--prefix", environment, "black", "--version"],
+    }
+    versions = {}
+    for name, args in commands.items():
+        result = subprocess.run(command(args), cwd=ROOT, env=env, capture_output=True, text=True)
+        assert result.returncode == 0
+        versions[name] = (result.stdout + result.stderr).strip()
+    identities = json.loads((ARTIFACTS / "run-identities.json").read_text())
+    identities.update(versions)
+    if "python" in identities:
+        identities["launcher_python"] = identities.pop("python")
+    (ARTIFACTS / "run-identities.json").write_text(json.dumps(identities, indent=2, sort_keys=True) + "\n")
 
 
 def main():
@@ -178,21 +215,26 @@ def main():
         "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF"),
         "runner_os": os.environ.get("RUNNER_OS"),
         "runner_arch": os.environ.get("RUNNER_ARCH"),
-        "python": sys.version,
+        "launcher_python": sys.version,
     }, indent=2, sort_keys=True) + "\n")
     solve = capture("environment-solve", [mamba, "env", "create", "--yes", "--prefix", environment, "--file", ROOT / "environment.yml"], env)
     if solve:
         artifact_manifest()
         raise SystemExit(solve)
     validate_conda_identity(environment)
-    failures = [validate_import_identity(mamba, environment, env)]
+    runtime_identity(mamba, environment, env)
+    import_failure = validate_import_identity(mamba, environment, env)
+    if import_failure:
+        package_exports(conda, mamba, environment, env)
+        raise SystemExit(import_failure)
+    failures = []
     black_identity(mamba, environment, env)
     failures += [
         capture("black", [mamba, "run", "--prefix", environment, "black", ".", "--diff", "--check"], env),
         capture("mypy", [mamba, "run", "--prefix", environment, "mypy", "cadquery"], env),
         capture("pytest", [mamba, "run", "--prefix", environment, "pytest", "-v", "--gui", "--cov", "--junitxml", ARTIFACTS / "pytest.xml"], env),
     ]
-    copy_if_present(ROOT / ".coverage", ARTIFACTS / ".coverage")
+    copy_if_present(ROOT / ".coverage", ARTIFACTS / "coverage.data")
     package_exports(conda, mamba, environment, env)
     if any(failures):
         raise SystemExit(1)
