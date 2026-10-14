@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: CadQuery/cadquery
-          ref: 9a6a705fe73ae94300974a3c668719f907b6353f
+          ref: 5f5bc62b255f62e3512105740025361b6c31eddd
           path: source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
@@ -41,9 +41,27 @@ jobs:
           python --version
           uname -a
           df -h .
+      - name: Install checksum-verified Miniforge
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/cadquery-baseline-miniforge"
+          mkdir -p "$base"
+          curl --fail --location --output "$base/Miniforge.sh" https://github.com/conda-forge/miniforge/releases/download/26.1.1-3/Miniforge3-26.1.1-3-Linux-x86_64.sh
+          curl --fail --location --output "$base/Miniforge.sha256" https://github.com/conda-forge/miniforge/releases/download/26.1.1-3/Miniforge3-26.1.1-3-Linux-x86_64.sh.sha256
+          expected="$(awk '{print $1}' "$base/Miniforge.sha256")"
+          actual="$(sha256sum "$base/Miniforge.sh" | awk '{print $1}')"
+          test "$actual" = "$expected"
+          bash "$base/Miniforge.sh" -b -p "$RUNNER_TEMP/cadquery-baseline/miniforge"
       - name: Install declared dependencies and run complete baseline
         working-directory: source
         run: python ../validation/cadquery-validation-2104/baseline.py
+      - name: Upload baseline environment and test artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cadquery-baseline-linux-2107
+          path: ${{ runner.temp }}/cadquery-baseline/artifacts
+          if-no-files-found: error
       - name: Record final source state
         if: ${{ !cancelled() }}
         working-directory: source
