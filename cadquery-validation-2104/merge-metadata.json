@@ -1,0 +1,22 @@
+{
+  "author_email": "priyanshrana18@gmail.com",
+  "author_name": "RanaPriyansh",
+  "author_offset": "+0530",
+  "author_timestamp": 1792016770,
+  "commit": "2b85056876c75d4380cf821aa4055d44963cccf7",
+  "committer_email": "priyanshrana18@gmail.com",
+  "committer_name": "RanaPriyansh",
+  "committer_offset": "+0530",
+  "committer_timestamp": 1792016770,
+  "first_parent": "5dfbf5c89932d9c438ba449e29732a6a56680aae",
+  "git_version": "git version 2.54.0 (Apple Git-157)",
+  "message_sha256": "7cbae2d80f9809d16d29c49eaee0624459a23bc7d409020dd44bf4bc981e79ea",
+  "options": [
+    "--no-ff",
+    "--no-commit"
+  ],
+  "raw_sha256": "621926d4ac8a2a6f73d5826419cf11dbd5ed31f584f633682b584c7178b630bb",
+  "second_parent": "5f5bc62b255f62e3512105740025361b6c31eddd",
+  "strategy": "ort",
+  "tree": "ffd928a746b4cfaf8a2a27a3b8c7e4111efb05f1"
+}
