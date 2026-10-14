@@ -2,33 +2,36 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import time
-import shutil
-
+import zipfile
 
 HEAD = "5f5bc62b255f62e3512105740025361b6c31eddd"
-SOURCE_HASH = "054b005f9a3a936e9c47455493a4078bc33fc2c342f69f9d0fa5c6f7ec0689c"
+SOURCE_HASH = "054b005f9a3a936e9c47455493a4078bc33fc2c342f69f9d0fa5c6f7ec0689c6"
+BLACK_REPOSITORY = "https://github.com/cadquery/black.git"
 ROOT = Path.cwd().resolve()
 TEMP = Path(os.environ["RUNNER_TEMP"]).resolve() / "cadquery-baseline"
 ARTIFACTS = TEMP / "artifacts"
 START = time.monotonic()
 
 
-def run(args, **kwargs):
-    print("COMMAND", json.dumps([str(arg) for arg in args]), flush=True)
-    return subprocess.run(args, check=False, **kwargs)
+def command(args):
+    args = [str(arg) for arg in args]
+    print("COMMAND", json.dumps(args), flush=True)
+    return args
 
 
-def run_logged(name, args, env):
-    log = ARTIFACTS / f"{name}.log"
-    exit_file = ARTIFACTS / f"{name}.exit"
-    with log.open("x") as stream:
-        stream.write("COMMAND " + json.dumps([str(arg) for arg in args]) + "\n")
-        result = subprocess.run(args, cwd=ROOT, env=env, stdout=stream, stderr=subprocess.STDOUT)
-    exit_file.write_text(f"{result.returncode}\n")
-    print("CHECK", name, result.returncode, flush=True)
+def capture(name, args, env, cwd=ROOT):
+    args = command(args)
+    stdout = ARTIFACTS / f"{name}.stdout"
+    stderr = ARTIFACTS / f"{name}.stderr"
+    with stdout.open("x") as out, stderr.open("x") as err:
+        result = subprocess.run(args, cwd=cwd, env=env, stdout=out, stderr=err)
+    (ARTIFACTS / f"{name}.exit").write_text(f"{result.returncode}\n")
+    print("RESULT", name, result.returncode, flush=True)
     return result.returncode
 
 
@@ -39,39 +42,8 @@ def copy_if_present(source, destination):
         shutil.copy2(source, destination)
 
 
-def export_environment(mamba, environment, env):
+def source_identity(stage):
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
-    commands = [
-        ("conda-explicit.txt", [mamba, "list", "--prefix", str(environment), "--explicit"]),
-        ("conda-list.json", [mamba, "list", "--prefix", str(environment), "--json"]),
-        ("environment-resolved.json", [mamba, "env", "export", "--prefix", str(environment), "--json"]),
-        ("pip-freeze.txt", [mamba, "run", "--prefix", str(environment), "python", "-m", "pip", "freeze", "--all"]),
-        ("pip-inspect.json", [mamba, "run", "--prefix", str(environment), "python", "-m", "pip", "inspect"]),
-    ]
-    for filename, command in commands:
-        result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True)
-        (ARTIFACTS / filename).write_text(result.stdout + result.stderr)
-        (ARTIFACTS / f"{filename}.exit").write_text(f"{result.returncode}\n")
-    black_url = subprocess.run(
-        [mamba, "run", "--prefix", str(environment), "python", "-c", "import importlib.metadata as m; print(m.distribution('black')._path / 'direct_url.json')"],
-        cwd=ROOT, env=env, capture_output=True, text=True,
-    )
-    (ARTIFACTS / "black-direct-url-command.log").write_text(black_url.stdout + black_url.stderr)
-    if black_url.returncode == 0:
-        copy_if_present(black_url.stdout.strip(), ARTIFACTS / "black-direct-url.json")
-    (ARTIFACTS / "source-environment.yml.sha256").write_text(
-        hashlib.sha256((ROOT / "environment.yml").read_bytes()).hexdigest() + "  environment.yml\n"
-    )
-    manifest = {}
-    for path in sorted(ARTIFACTS.iterdir()):
-        if path.name == "artifact-manifest.json":
-            continue
-        if path.is_file():
-            manifest[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    (ARTIFACTS / "artifact-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-
-
-def identity(stage):
     assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == HEAD
     assert not subprocess.check_output(["git", "diff", "--name-only"])
     assert not subprocess.check_output(["git", "diff", "--cached", "--name-only"])
@@ -81,7 +53,106 @@ def identity(stage):
         digest.update(raw + b"\0" + (ROOT / os.fsdecode(raw)).read_bytes() + b"\0")
     assert len(paths) == 219
     assert digest.hexdigest() == SOURCE_HASH
+    (ARTIFACTS / f"source-identity-{stage}.json").write_text(json.dumps({
+        "stage": stage,
+        "head": HEAD,
+        "tracked_files": len(paths),
+        "tracked_digest": digest.hexdigest(),
+    }, indent=2, sort_keys=True) + "\n")
     print("SOURCE_IDENTITY", stage, HEAD, len(paths), digest.hexdigest(), flush=True)
+
+
+def conda_records(environment):
+    return [json.loads(path.read_text()) for path in sorted((environment / "conda-meta").glob("*.json"))]
+
+
+def validate_import_identity(mamba, environment, env):
+    code = "import cadquery, importlib.metadata as m, OCP; print(cadquery.__file__); print(OCP.__file__); print(m.version('cadquery'))"
+    result = subprocess.run(command([mamba, "run", "--prefix", environment, "python", "-c", code]), cwd=ROOT, env=env, capture_output=True, text=True)
+    (ARTIFACTS / "import-identity.stdout").write_text(result.stdout)
+    (ARTIFACTS / "import-identity.stderr").write_text(result.stderr)
+    (ARTIFACTS / "import-identity.exit").write_text(f"{result.returncode}\n")
+    if result.returncode:
+        return result.returncode
+    cadquery_path, ocp_path, _ = result.stdout.strip().splitlines()
+    assert Path(cadquery_path).resolve().is_relative_to(ROOT)
+    assert Path(ocp_path).resolve().is_relative_to(Path(environment).resolve())
+    (ARTIFACTS / "imported-source-paths.json").write_text(json.dumps({"cadquery": cadquery_path, "OCP": ocp_path}, indent=2) + "\n")
+    return 0
+
+
+def validate_conda_identity(environment):
+    records = conda_records(environment)
+    ocp = [record for record in records if record.get("name") == "ocp"]
+    assert len(ocp) == 1 and ocp[0]["version"] == "8.0.1.1"
+    payload = {key: ocp[0].get(key) for key in ("name", "version", "build", "build_number", "channel")}
+    (ARTIFACTS / "ocp-conda-identity.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def black_identity(mamba, environment, env):
+    code = "import importlib.metadata as m; print(m.distribution('black')._path / 'direct_url.json')"
+    result = subprocess.run(command([mamba, "run", "--prefix", environment, "python", "-c", code]), cwd=ROOT, env=env, capture_output=True, text=True)
+    (ARTIFACTS / "black-direct-url-command.stdout").write_text(result.stdout)
+    (ARTIFACTS / "black-direct-url-command.stderr").write_text(result.stderr)
+    (ARTIFACTS / "black-direct-url-command.exit").write_text(f"{result.returncode}\n")
+    assert result.returncode == 0
+    direct_url = Path(result.stdout.strip())
+    assert direct_url.name == "direct_url.json" and direct_url.is_file()
+    data = json.loads(direct_url.read_text())
+    assert data.get("url") == BLACK_REPOSITORY
+    vcs = data.get("vcs_info", {})
+    assert vcs.get("vcs") == "git" and vcs.get("requested_revision") == "cq"
+    assert re.fullmatch(r"[0-9a-f]{40}", vcs.get("commit_id", ""))
+    shutil.copy2(direct_url, ARTIFACTS / "black-direct-url.json")
+    (ARTIFACTS / "black-identity.json").write_text(json.dumps(data, indent=2) + "\n")
+
+
+def package_exports(conda, mamba, environment, env):
+    exports = [
+        ("conda-explicit", [conda, "list", "--prefix", environment, "--explicit", "--md5"]),
+        ("conda-list", [conda, "list", "--prefix", environment, "--json"]),
+        ("environment-resolved", [conda, "env", "export", "--prefix", environment, "--json"]),
+        ("pip-freeze", [mamba, "run", "--prefix", environment, "python", "-m", "pip", "freeze", "--all"]),
+        ("pip-inspect", [mamba, "run", "--prefix", environment, "python", "-m", "pip", "inspect"]),
+    ]
+    failures = [capture(f"export-{name}", args, env) for name, args in exports]
+    assert not any(failures)
+    conda_json = json.loads((ARTIFACTS / "export-conda-list.stdout").read_text())
+    inspect_json = json.loads((ARTIFACTS / "export-pip-inspect.stdout").read_text())
+    conda_names = {record["name"].lower().replace("_", "-") for record in conda_json}
+    pip_only = []
+    for item in inspect_json.get("installed", []):
+        name = item["metadata"]["name"].lower().replace("_", "-")
+        if name == "cadquery" or name in conda_names:
+            continue
+        direct_url = item.get("direct_url", {})
+        vcs = direct_url.get("vcs_info", {})
+        if vcs.get("vcs") == "git":
+            pip_only.append(f"{name} @ {direct_url['url']}@{vcs['commit_id']}")
+        else:
+            pip_only.append(f"{name}=={item['metadata']['version']}")
+    (ARTIFACTS / "pip-only-requirements.txt").write_text("\n".join(sorted(pip_only)) + "\n")
+    wheelhouse = ARTIFACTS / "wheels"
+    wheelhouse.mkdir()
+    assert capture("pip-wheel-build", [mamba, "run", "--prefix", environment, "python", "-m", "pip", "wheel", "--wheel-dir", wheelhouse, "--no-deps", "--requirement", ARTIFACTS / "pip-only-requirements.txt"], env) == 0
+    hashed = []
+    for wheel in sorted(wheelhouse.glob("*.whl")):
+        with zipfile.ZipFile(wheel) as archive:
+            metadata = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+            fields = dict(line.split(": ", 1) for line in archive.read(metadata).decode().splitlines() if ": " in line)
+        hashed.append(f"{fields['Name']}=={fields['Version']} --hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()}")
+    expected_names = sorted(line.split("==", 1)[0].split(" @ ", 1)[0].lower().replace("_", "-") for line in pip_only if line)
+    actual_names = sorted(line.split("==", 1)[0].lower().replace("_", "-") for line in hashed)
+    assert actual_names == expected_names
+    (ARTIFACTS / "pip-only-hashed-requirements.txt").write_text("\n".join(sorted(hashed)) + "\n")
+
+
+def artifact_manifest():
+    manifest = {}
+    for path in sorted(ARTIFACTS.rglob("*")):
+        if path.is_file() and path.name != "artifact-manifest.json":
+            manifest[str(path.relative_to(ARTIFACTS))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (ARTIFACTS / "artifact-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
 
 def main():
@@ -89,8 +160,8 @@ def main():
         assert key not in os.environ, key
     TEMP.mkdir(parents=True, exist_ok=True)
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
-    mamba_root = TEMP / "miniforge"
-    mamba = mamba_root / "bin" / "mamba"
+    mamba = TEMP / "miniforge" / "bin" / "mamba"
+    conda = TEMP / "miniforge" / "bin" / "conda"
     environment = TEMP / "environment"
     env = os.environ.copy()
     env.update({"MAMBA_ROOT_PREFIX": str(TEMP / "mamba-root"), "CONDA_PKGS_DIRS": str(TEMP / "conda-pkgs")})
@@ -99,30 +170,39 @@ def main():
     miniforge_download = TEMP.parent / "cadquery-baseline-miniforge"
     copy_if_present(miniforge_download / "Miniforge.sh", ARTIFACTS / "Miniforge.sh")
     copy_if_present(miniforge_download / "Miniforge.sha256", ARTIFACTS / "Miniforge.sha256")
-    solve = [str(mamba), "env", "create", "--yes", "--prefix", str(environment), "--file", str(ROOT / "environment.yml")]
-    solve_result = run(solve, cwd=ROOT, env=env)
-    (ARTIFACTS / "environment-solve.exit").write_text(f"{solve_result.returncode}\n")
-    if solve_result.returncode != 0:
-        raise SystemExit(solve_result.returncode)
-    python = [str(mamba), "run", "--prefix", str(environment), "python"]
-    identity("before-tests")
-    import_check = python + ["-c", "from pathlib import Path; import cadquery, importlib.metadata as m; assert Path(cadquery.__file__).resolve().is_relative_to(Path.cwd().resolve()); assert m.version('cadquery-ocp') == '8.0.1.1'; print('IMPORT_IDENTITY', cadquery.__file__, m.version('cadquery-ocp'))"]
-    failures = [run_logged("import", import_check, env)]
-    failures.append(run_logged("black", [str(mamba), "run", "--prefix", str(environment), "black", ".", "--diff", "--check"], env))
-    failures.append(run_logged("mypy", [str(mamba), "run", "--prefix", str(environment), "mypy", "cadquery"], env))
-    junit = ARTIFACTS / "pytest.xml"
-    failures.append(run_logged("pytest", [str(mamba), "run", "--prefix", str(environment), "pytest", "-v", "--gui", "--cov", "--junitxml", str(junit)], env))
-    export_environment(str(mamba), environment, env)
-    identity("after-tests")
+    shutil.copy2(ROOT / "environment.yml", ARTIFACTS / "environment.yml")
+    (ARTIFACTS / "run-identities.json").write_text(json.dumps({
+        "payload_sha": os.environ.get("GITHUB_SHA"),
+        "repository": os.environ.get("GITHUB_REPOSITORY"),
+        "run_id": os.environ.get("GITHUB_RUN_ID"),
+        "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF"),
+        "runner_os": os.environ.get("RUNNER_OS"),
+        "runner_arch": os.environ.get("RUNNER_ARCH"),
+        "python": sys.version,
+    }, indent=2, sort_keys=True) + "\n")
+    solve = capture("environment-solve", [mamba, "env", "create", "--yes", "--prefix", environment, "--file", ROOT / "environment.yml"], env)
+    if solve:
+        artifact_manifest()
+        raise SystemExit(solve)
+    validate_conda_identity(environment)
+    failures = [validate_import_identity(mamba, environment, env)]
+    black_identity(mamba, environment, env)
+    failures += [
+        capture("black", [mamba, "run", "--prefix", environment, "black", ".", "--diff", "--check"], env),
+        capture("mypy", [mamba, "run", "--prefix", environment, "mypy", "cadquery"], env),
+        capture("pytest", [mamba, "run", "--prefix", environment, "pytest", "-v", "--gui", "--cov", "--junitxml", ARTIFACTS / "pytest.xml"], env),
+    ]
+    copy_if_present(ROOT / ".coverage", ARTIFACTS / ".coverage")
+    package_exports(conda, mamba, environment, env)
     if any(failures):
         raise SystemExit(1)
 
 
 if __name__ == "__main__":
-    identity("initial")
+    source_identity("initial")
     try:
         main()
     finally:
-        if ROOT.exists():
-            identity("final")
+        source_identity("final")
+        artifact_manifest()
     print("CADQUERY_BASELINE_COMPLETE", round(time.monotonic() - START, 2), flush=True)

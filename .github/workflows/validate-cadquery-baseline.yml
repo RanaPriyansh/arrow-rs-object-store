@@ -56,7 +56,7 @@ jobs:
         working-directory: source
         run: python ../validation/cadquery-validation-2104/baseline.py
       - name: Upload baseline environment and test artifacts
-        if: ${{ !cancelled() }}
+        if: ${{ always() && !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: cadquery-baseline-linux-2107
