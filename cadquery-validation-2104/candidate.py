@@ -8,10 +8,14 @@ import time
 import xml.etree.ElementTree as ET
 
 
-HEAD = "9a6a705fe73ae94300974a3c668719f907b6353f"
-BASE_HASH = "21b4acc82fc9068881de9368f149e3798c0541980205e2d7a4e7820b732d3fd5"
-SOURCE_HASH = BASE_HASH
-CANDIDATE_HASH = '3fffdf628b8e6a84d26a1d2291443cc51e1a3a2c434a4d6a71645bb20e8417bc'
+PR_HEAD = "5dfbf5c89932d9c438ba449e29732a6a56680aae"
+MASTER_HEAD = "5f5bc62b255f62e3512105740025361b6c31eddd"
+MERGE_HEAD = "2b85056876c75d4380cf821aa4055d44963cccf7"
+MERGE_TREE = "ffd928a746b4cfaf8a2a27a3b8c7e4111efb05f1"
+BASE_HASH = "054b005f9a3a936e9c47455493a4078bc33fc2c342f69f9d0fa5c6f7ec0689c6"
+SOURCE_HASH = "c940a32d7e7009cc5793067c76783969571513087d6c9362cb7fa9c2c36cc29c"
+BASELINE_RUN = "38646497682"
+BASELINE_ARTIFACT = "11933066912"
 PAYLOAD = Path(__file__).resolve().parent
 ROOT = Path.cwd().resolve()
 TEMP = Path(os.environ["RUNNER_TEMP"]).resolve() / "cadquery-candidate"
@@ -24,9 +28,8 @@ def run(args, **kwargs):
 
 
 def identity(stage):
-    assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == HEAD
-    changed = subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines()
-    assert changed == ([] if SOURCE_HASH == BASE_HASH else ["tests/test_free_functions.py"])
+    assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == MERGE_HEAD
+    assert not subprocess.check_output(["git", "diff", "--name-only"])
     assert not subprocess.check_output(["git", "diff", "--cached", "--name-only"])
     paths = subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0")[:-1]
     digest = hashlib.sha256()
@@ -34,15 +37,29 @@ def identity(stage):
         digest.update(raw + b"\0" + (ROOT / os.fsdecode(raw)).read_bytes() + b"\0")
     assert len(paths) == 219
     assert digest.hexdigest() == SOURCE_HASH
-    print("SOURCE_IDENTITY", stage, HEAD, len(paths), digest.hexdigest(), flush=True)
+    print("SOURCE_IDENTITY", stage, MERGE_HEAD, len(paths), digest.hexdigest(), flush=True)
+
+
+def prepare_merge():
+    assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == PR_HEAD
+    run(["git", "fetch", "--no-tags", "https://github.com/CadQuery/cadquery.git", MASTER_HEAD])
+    run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "merge", "--no-ff", "--no-commit", "--strategy=ort", MASTER_HEAD])
+    message = TEMP / "merge-message.txt"
+    message.parent.mkdir(parents=True, exist_ok=True)
+    message.write_text("Merge commit '" + MASTER_HEAD + "'\n\n")
+    commit_env = os.environ.copy()
+    commit_env.update({
+        "GIT_AUTHOR_NAME": "RanaPriyansh", "GIT_AUTHOR_EMAIL": "priyanshrana18@gmail.com",
+        "GIT_AUTHOR_DATE": "@1792016770 +0530", "GIT_COMMITTER_NAME": "RanaPriyansh",
+        "GIT_COMMITTER_EMAIL": "priyanshrana18@gmail.com", "GIT_COMMITTER_DATE": "@1792016770 +0530",
+    })
+    run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-c", "i18n.commitEncoding=UTF-8", "commit", "--no-verify", "--cleanup=verbatim", "--file", message], env=commit_env)
+    assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == MERGE_HEAD
+    assert subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip() == MERGE_TREE
 
 
 def main():
     global SOURCE_HASH
-    constraints = PAYLOAD / "constraints.txt"
-    patch = PAYLOAD / "candidate.patch"
-    assert hashlib.sha256(constraints.read_bytes()).hexdigest() == '6655f2ddd717d5541ac3dc07f43b4a7a5e713e701251fe0ff8cd4e0593dd24d8'
-    assert hashlib.sha256(patch.read_bytes()).hexdigest() == '7f71493331594c5cb9df362559166b4471442a7fabc385f09f69c0cb64a26878'
     assert sys.version_info[:2] == (3, 11)
     for key in ("CONDA_PREFIX", "CONDA_PY", "READTHEDOCS", "APPVEYOR"):
         assert key not in os.environ, key
@@ -51,7 +68,9 @@ def main():
     run([sys.executable, "-m", "venv", str(environment)])
     python = environment / "bin" / "python"
     report = TEMP / "install-report.json"
-    run([str(python), "-m", "pip", "install", "--report", str(report), "-c", str(constraints), "-e", ".[dev]"])
+    prepare_merge()
+    identity("after-merge")
+    run([str(python), "-m", "pip", "install", "--report", str(report), "--no-deps", "--no-build-isolation", "--editable", "."])
     run([str(python), "-m", "pip", "check"])
     run([str(python), "-m", "pip", "freeze", "--all"])
     run([
@@ -61,10 +80,7 @@ def main():
         "assert m.version('cadquery-ocp') in ('8.0.1.1', '8.0.1.1.0'); "
         "print('IMPORT_IDENTITY', cadquery.__file__, m.version('cadquery-ocp'))",
     ])
-    run(["git", "apply", "--check", str(patch)])
-    run(["git", "apply", str(patch)])
-    SOURCE_HASH = CANDIDATE_HASH
-    identity("after-patch")
+    identity("after-editable-install")
     formatter = TEMP / "formatter"
     run([sys.executable, "-m", "venv", str(formatter)])
     formatter_python = formatter / "bin" / "python"
@@ -96,7 +112,6 @@ def main():
 
 
 if __name__ == "__main__":
-    identity("initial")
     try:
         main()
     finally:

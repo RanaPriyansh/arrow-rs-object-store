@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: CadQuery/cadquery
-          ref: 9a6a705fe73ae94300974a3c668719f907b6353f
+          ref: 5dfbf5c89932d9c438ba449e29732a6a56680aae
           path: source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
