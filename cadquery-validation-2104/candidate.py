@@ -190,13 +190,14 @@ def validate_merge_metadata(metadata, raw, message):
     return {"commit": MERGE_HEAD, "tree": MERGE_TREE, "raw_sha256": RAW_SHA256, "message_sha256": MESSAGE_SHA256}
 
 
+
 CHECKS = (
     ("black", ("black", ".", "--diff", "--check")),
     ("mypy", ("mypy", "cadquery")),
     ("pytest", ("pytest", "-v", "--gui", "--cov")),
 )
-RUNTIME_SCRIPT = "import cadquery, OCP, importlib.metadata, json, pathlib, sys; direct=json.loads((pathlib.Path(importlib.metadata.distribution('black')._path)/'direct_url.json').read_text()); print(json.dumps({'python_executable': sys.executable, 'python_prefix': sys.prefix, 'cadquery_path': str(cadquery.__file__), 'ocp_path': str(OCP.__file__), 'ocp_version': importlib.metadata.version('cadquery-ocp'), 'python_version': list(sys.version_info[:3]), 'black_commit': direct['vcs_info']['commit_id']}))"
 
+RUNTIME_SCRIPT = "import cadquery, OCP, importlib.metadata, json, pathlib, sys; direct=json.loads((pathlib.Path(importlib.metadata.distribution('black')._path)/'direct_url.json').read_text()); print(json.dumps({'python_executable': sys.executable, 'python_prefix': sys.prefix, 'cadquery_path': str(cadquery.__file__), 'ocp_path': str(OCP.__file__), 'python_version': list(sys.version_info[:3]), 'black_version': importlib.metadata.version('black'), 'black_commit': direct['vcs_info']['commit_id']}))"
 
 def _exclusive_write(path, data):
     path = Path(path)
@@ -204,200 +205,213 @@ def _exclusive_write(path, data):
     with path.open("x", encoding="utf-8") as stream:
         stream.write(data)
 
+def _safe_env(extra=None):
+    env = {key: value for key, value in os.environ.items() if "TOKEN" not in key.upper()}
+    if extra:
+        env.update({key: value for key, value in extra.items() if "TOKEN" not in key.upper()})
+    env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
+    return env
 
-def _safe_env():
-    return {key: value for key, value in os.environ.items() if "TOKEN" not in key.upper()}
-
+def _reserve(evidence_dir, label):
+    evidence_dir = Path(evidence_dir)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    paths = {name: evidence_dir / f"{label}.{name}" for name in ("stdout", "stderr", "exit")}
+    streams = {}
+    try:
+        for name in ("stdout", "stderr"):
+            streams[name] = paths[name].open("x", encoding="utf-8")
+        paths["exit"].open("x", encoding="utf-8").close()
+    except BaseException:
+        for stream in streams.values(): stream.close()
+        raise
+    return paths, streams
 
 def _run(command, cwd, evidence_dir, label, env=None, check=True):
-    evidence_dir = Path(evidence_dir)
-    result = subprocess.run(command, cwd=str(cwd), env=_safe_env() | (env or {}), capture_output=True, text=True, check=False)
-    _exclusive_write(evidence_dir / f"{label}.stdout", result.stdout or "")
-    _exclusive_write(evidence_dir / f"{label}.stderr", result.stderr or "")
-    _exclusive_write(evidence_dir / f"{label}.exit", f"{result.returncode}\n")
-    if check and result.returncode:
-        raise RuntimeError(f"{label} failed with exit {result.returncode}")
+    paths, streams = _reserve(evidence_dir, label)
+    try:
+        process = subprocess.Popen(command, cwd=str(cwd), env=_safe_env(env), stdout=streams["stdout"], stderr=streams["stderr"], text=True)
+        code = process.wait()
+    except BaseException:
+        for stream in streams.values(): stream.close()
+        raise
+    finally:
+        for stream in streams.values(): stream.close()
+    paths["exit"].write_text(f"{code}\n", encoding="utf-8")
+    stdout = paths["stdout"].read_text()
+    stderr = paths["stderr"].read_text()
+    result = subprocess.CompletedProcess(command, code, stdout, stderr)
+    if check and code:
+        raise RuntimeError(f"{label} failed with exit {code}")
     return result
-
 
 def _tracked_digest(source):
     source = Path(source)
     names = subprocess.check_output(("git", "ls-files", "-z"), cwd=str(source)).split(b"\0")
+    names = names[:-1]
+    if len(names) != 219:
+        raise ValueError(f"tracked file count changed: {len(names)}")
     digest = hashlib.sha256()
-    for name in names[:-1]:
+    for name in names:
         digest.update(name + b"\0" + (source / os.fsdecode(name)).read_bytes() + b"\0")
     return digest.hexdigest()
 
-
 def _read_json_output(result, label):
-    try:
-        return json.loads(result.stdout)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label} did not return JSON") from exc
-
+    try: return json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc: raise ValueError(f"{label} did not return JSON") from exc
 
 def _require_output(result, expected, label):
-    if result.stdout.strip() != expected:
+    actual = result.stdout if expected == "" else result.stdout.rstrip("\n")
+    if actual != expected or (expected and not result.stdout.endswith("\n")):
         raise ValueError(f"{label} identity mismatch")
 
+def _tool(env_prefix, name):
+    path = Path(env_prefix) / "bin" / name
+    if not path.exists(): raise FileNotFoundError(path)
+    return str(path)
 
 def _inventory(source, env_prefix, evidence_dir, phase, suffix):
-    conda_executable = os.environ.get("CANDIDATE_CONDA", "conda")
-    conda = _run((conda_executable, "list", "--prefix", str(env_prefix), "--json"), source, evidence_dir, f"{phase}-{suffix}-conda-list")
-    explicit = _run((conda_executable, "list", "--prefix", str(env_prefix), "--explicit"), source, evidence_dir, f"{phase}-{suffix}-conda-explicit")
-    export = _run((conda_executable, "env", "export", "--prefix", str(env_prefix), "--json"), source, evidence_dir, f"{phase}-{suffix}-conda-export")
-    pip = _run((str(Path(env_prefix) / "bin/python"), "-m", "pip", "inspect"), source, evidence_dir, f"{phase}-{suffix}-pip-inspect")
-    freeze = _run((str(Path(env_prefix) / "bin/python"), "-m", "pip", "freeze"), source, evidence_dir, f"{phase}-{suffix}-pip-freeze")
+    conda = _run((os.environ.get("CANDIDATE_CONDA", _tool(env_prefix, "conda")), "list", "--prefix", str(env_prefix), "--json"), source, evidence_dir, f"{phase}-{suffix}-conda-list")
+    explicit = _run((os.environ.get("CANDIDATE_CONDA", _tool(env_prefix, "conda")), "list", "--prefix", str(env_prefix), "--explicit", "--md5"), source, evidence_dir, f"{phase}-{suffix}-conda-explicit")
+    export = _run((os.environ.get("CANDIDATE_CONDA", _tool(env_prefix, "conda")), "env", "export", "--prefix", str(env_prefix), "--json"), source, evidence_dir, f"{phase}-{suffix}-conda-export")
+    python = _tool(env_prefix, "python")
+    pip = _run((python, "-m", "pip", "inspect"), source, evidence_dir, f"{phase}-{suffix}-pip-inspect")
+    freeze = _run((python, "-m", "pip", "freeze", "--all"), source, evidence_dir, f"{phase}-{suffix}-pip-freeze")
     return {"conda": _read_json_output(conda, f"{phase} conda list"), "explicit": explicit.stdout, "export": _read_json_output(export, f"{phase} conda export"), "pip": _read_json_output(pip, f"{phase} pip inspect"), "freeze": freeze.stdout}
 
+def _ocp_record(env_prefix):
+    records=[]
+    for path in (Path(env_prefix)/"conda-meta").glob("*.json"):
+        data=json.loads(path.read_text())
+        if data.get("name") == "ocp": records.append(data)
+    if len(records)!=1 or records[0].get("version") != "8.0.1.1": raise ValueError("OCP conda metadata is invalid")
+    return records[0]
 
-def _source_record(source, evidence_dir, phase):
-    head = _run(("git", "rev-parse", "HEAD"), source, evidence_dir, f"{phase}-source-head").stdout.strip()
-    tree = _run(("git", "rev-parse", "HEAD^{tree}"), source, evidence_dir, f"{phase}-source-tree").stdout.strip()
+def _source_record(source, evidence_dir, phase, expected_head=None, expected_tree=None, expected_digest=None):
+    head = _run(("git", "rev-parse", "HEAD"), source, evidence_dir, f"{phase}-source-head").stdout
+    tree = _run(("git", "rev-parse", "HEAD^{tree}"), source, evidence_dir, f"{phase}-source-tree").stdout
     status = _run(("git", "status", "--porcelain=v1", "--untracked-files=all"), source, evidence_dir, f"{phase}-source-status").stdout
     digest = _tracked_digest(source)
-    _exclusive_write(evidence_dir / f"{phase}-source-record.json", json.dumps({"phase": phase, "source": str(Path(source).resolve()), "head": head, "tree": tree, "tracked_digest": digest, "status": status}, indent=2) + "\n")
-    return {"head": head, "tree": tree, "tracked_digest": digest, "status": status}
-
+    tracked_status = "\n".join(line for line in status.splitlines() if line and not line.startswith("??"))
+    if tracked_status.strip(): raise ValueError(f"{phase} tracked tree is dirty: {tracked_status}")
+    if expected_head is not None: _require_output(type("R",(),{"stdout":head})(), expected_head, f"{phase} HEAD")
+    if expected_tree is not None: _require_output(type("R",(),{"stdout":tree})(), expected_tree, f"{phase} tree")
+    if expected_digest is not None and digest != expected_digest: raise ValueError(f"{phase} source digest mismatch")
+    record={"phase":phase,"source":str(Path(source).resolve()),"head":head.strip(),"tree":tree.strip(),"tracked_digest":digest,"tracked_files":219,"status":status}
+    _exclusive_write(evidence_dir / f"{phase}-source-record.json", json.dumps(record, indent=2)+"\n")
+    return record
 
 def _runtime(neutral, env_prefix, evidence_dir, phase, expected_source):
-    result = _run((str(Path(env_prefix) / "bin/python"), "-c", RUNTIME_SCRIPT), neutral, evidence_dir, f"{phase}-runtime", {"CANDIDATE_EXPECTED_SOURCE": str(expected_source)})
-    return _read_json_output(result, f"{phase} runtime")
+    result=_run((_tool(env_prefix,"python"),"-c",RUNTIME_SCRIPT), neutral, evidence_dir, f"{phase}-runtime", {"CANDIDATE_EXPECTED_SOURCE":str(expected_source)})
+    runtime=_read_json_output(result,f"{phase} runtime")
+    runtime["ocp_record"]=_ocp_record(env_prefix)
+    runtime["ocp_version"] = runtime["ocp_record"]["version"]
+    runtime["ocp_path"] = runtime["ocp_path"]
+    return runtime
 
-
-def _compare_boundaries(before, after, before_source, after_source):
-    validate_conda_inventory(before["conda"], after["conda"], before["explicit"], after["explicit"])
-    validate_pip_inventory(before["pip"], after["pip"], before_source, after_source)
-    return {"conda": len(conda_owned(before["conda"])), "pip": len(pip_records(after["pip"]))}
-
+def _compare_boundaries(before, after, before_source, after_source, evidence_dir, label):
+    conda=validate_conda_inventory(before["conda"],after["conda"],before["explicit"],after["explicit"])
+    pip=validate_pip_inventory(before["pip"],after["pip"],before_source,after_source)
+    result={"conda":conda,"pip":pip,"before_source":str(Path(before_source).resolve()),"after_source":str(Path(after_source).resolve())}
+    _exclusive_write(Path(evidence_dir)/f"comparison-{label}.json",json.dumps(result,indent=2)+"\n")
+    return result
 
 def _check_phase(source, env_prefix, evidence_dir, phase, baseline_xml, candidate=False):
-    settings = {"NUMBA_JIT_COVERAGE": "1", "NUMBA_DISABLE_JIT": "1", "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "NUMBA_NUM_THREADS": "1"}
+    settings={"NUMBA_JIT_COVERAGE":"1","NUMBA_DISABLE_JIT":"1","OMP_NUM_THREADS":"1","OPENBLAS_NUM_THREADS":"1","MKL_NUM_THREADS":"1","NUMBA_NUM_THREADS":"1"}
     for label, command in CHECKS:
-        _run(command if label != "pytest" else command + ("--junitxml", str(Path(evidence_dir) / f"{phase}.xml"),), source, evidence_dir, f"{phase}-{label}", settings)
-    xml = Path(evidence_dir) / f"{phase}.xml"
-    if not xml.exists():
-        raise FileNotFoundError(xml)
-    validate_xml(xml, baseline_xml, candidate=candidate)
-    coverage = Path(source) / ".coverage"
-    if not coverage.exists() or coverage.stat().st_size == 0:
-        raise ValueError(f"{phase} coverage is missing")
-    target = Path(evidence_dir) / f"{phase}-coverage.data"
-    shutil.copyfile(coverage, target)
-    if target.stat().st_size == 0:
-        raise ValueError(f"{phase} coverage is empty")
-
+        full=(_tool(env_prefix,label),)+command[1:]
+        if label=="pytest": full += ("--junitxml",str(Path(evidence_dir)/f"{phase}.xml"))
+        _run(full,source,evidence_dir,f"{phase}-{label}",settings)
+    xml=Path(evidence_dir)/f"{phase}.xml"
+    if not xml.exists(): raise FileNotFoundError(xml)
+    result=validate_xml(xml,baseline_xml,candidate=candidate)
+    coverage=Path(source)/".coverage"
+    if not coverage.exists() or coverage.stat().st_size==0: raise ValueError(f"{phase} coverage is missing")
+    target=Path(evidence_dir)/f"{phase}-coverage.data"; shutil.copyfile(coverage,target)
+    if target.stat().st_size==0: raise ValueError(f"{phase} coverage is empty")
+    _exclusive_write(Path(evidence_dir)/f"{phase}-result.json",json.dumps(result,indent=2)+"\n")
+    return result
 
 def artifact_manifest(root, output):
-    root, output = Path(root), Path(output)
-    rows = []
+    root,output=Path(root),Path(output); rows=[]
     for path in sorted(root.rglob("*")):
         if path.is_file() and path != output:
-            rows.append({"path": str(path.relative_to(root)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "size": path.stat().st_size})
-    _exclusive_write(output, json.dumps(rows, indent=2) + "\n")
-    return rows
+            relative=path.relative_to(root)
+            if Path(relative).is_absolute() or ".." in relative.parts: raise ValueError("manifest path escaped evidence")
+            rows.append({"path":str(relative),"sha256":hashlib.sha256(path.read_bytes()).hexdigest(),"size":path.stat().st_size})
+    _exclusive_write(output,json.dumps(rows,indent=2)+"\n"); return rows
 
+def _copy_required(evidence, metadata_dir, baseline):
+    for src,name in ((baseline/"environment.yml","baseline-environment.yml"),(metadata_dir/"merge-metadata.json","merge-metadata.json"),(metadata_dir/"merge-message.txt","merge-message.txt"),(metadata_dir/"merge-commit.raw","merge-commit.raw")):
+        if not src.exists(): raise FileNotFoundError(src)
+        shutil.copyfile(src,Path(evidence)/name)
 
 def main():
-    task = Path(os.environ.get("CANDIDATE_TASK_DIR", tempfile.mkdtemp(prefix="cadquery-candidate-"))).resolve()
-    evidence = task / "evidence" / os.environ.get("GITHUB_RUN_ID", "local") / os.environ.get("GITHUB_RUN_ATTEMPT", "1")
-    baseline = Path(os.environ.get("CANDIDATE_BASELINE_SOURCE", task / "baseline")).resolve()
-    candidate = Path(os.environ.get("CANDIDATE_SOURCE", task / "candidate")).resolve()
-    neutral = task / "neutral"
-    env_prefix = Path(os.environ.get("CANDIDATE_ENV", task / "env")).resolve()
-    baseline_xml = evidence / "baseline-pytest.xml"
-    primary = None
-    secondary = []
-    final_candidate_inventory = None
-    evidence.mkdir(parents=True, exist_ok=True)
+    task=Path(os.environ.get("CANDIDATE_TASK_DIR",tempfile.mkdtemp(prefix="cadquery-candidate-"))).resolve()
+    evidence=task/"evidence"/os.environ.get("GITHUB_RUN_ID","local")/os.environ.get("GITHUB_RUN_ATTEMPT","1")
+    if evidence.exists(): raise FileExistsError(f"evidence already exists: {evidence}")
+    evidence.mkdir(parents=True)
+    baseline=Path(os.environ.get("CANDIDATE_BASELINE_SOURCE",task/"baseline")).resolve(); candidate=Path(os.environ.get("CANDIDATE_SOURCE",task/"candidate")).resolve(); neutral=task/"neutral"; env_prefix=Path(os.environ.get("CANDIDATE_ENV",task/"env")).resolve(); metadata_dir=Path(__file__).resolve().parent
+    primary=None; secondary=[]; final_candidate_inventory=None; completed=False
     try:
-        _exclusive_write(evidence / "run-identity.json", json.dumps({"run_id": os.environ.get("GITHUB_RUN_ID", "local"), "attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "1"), "payload_sha": os.environ.get("GITHUB_SHA", "unknown"), "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF", "local"), "runner_os": os.name}, indent=2) + "\n")
-        _run(("git", "rev-parse", "HEAD"), Path.cwd(), evidence, "payload-head")
-        _run(("git", "fetch", "--no-tags", "--depth=4", "origin", PR_HEAD, MASTER_HEAD), candidate, evidence, "fetch-parents")
-        for name, ref in (("pr-parent", PR_HEAD), ("master-parent", MASTER_HEAD)):
-            parent = _run(("git", "rev-parse", f"{ref}^{{commit}}"), candidate, evidence, name)
-            if parent.stdout.strip():
-                _require_output(parent, ref, name)
-        merge_base = _run(("git", "merge-base", PR_HEAD, MASTER_HEAD), candidate, evidence, "merge-base")
-        if merge_base.stdout.strip():
-            _require_output(merge_base, "9a6a705fe73ae94300974a3c668719f907b6353f", "merge-base")
-        _run(("git", "checkout", "--detach", MASTER_HEAD), baseline, evidence, "checkout-baseline")
-        if _tracked_digest(baseline) != BASE_SOURCE_HASH:
-            raise ValueError("baseline source digest mismatch")
-        _source_record(baseline, evidence, "baseline")
-        mamba = os.environ.get("CANDIDATE_MAMBA", "mamba")
-        _run((mamba, "env", "create", "--yes", "--prefix", str(env_prefix), "--file", str(baseline / "environment.yml")), baseline, evidence, "solve-environment")
-        neutral.mkdir(parents=True, exist_ok=True)
-        runtime = _runtime(neutral, env_prefix, evidence, "baseline", baseline)
-        validate_runtime(runtime, env_prefix, baseline, "baseline")
-        first = _inventory(baseline, env_prefix, evidence, "baseline", "before")
-        _check_phase(baseline, env_prefix, evidence, "baseline", baseline_xml)
-        shutil.copyfile(evidence / "baseline.xml", baseline_xml)
-        validate_xml(baseline_xml)
-        second = _inventory(baseline, env_prefix, evidence, "baseline", "after")
-        _compare_boundaries(first, second, baseline, baseline)
-        _run(("git", "merge", "--no-ff", "--no-commit", "--strategy=ort", MASTER_HEAD), candidate, evidence, "merge-candidate")
-        metadata_dir = Path(__file__).resolve().parent
-        metadata = json.loads((metadata_dir / "merge-metadata.json").read_text())
-        raw = (metadata_dir / "merge-commit.raw").read_bytes()
-        message = (metadata_dir / "merge-message.txt").read_bytes()
-        validate_merge_metadata(metadata, raw, message)
-        _run(("git", "diff", "--check"), candidate, evidence, "candidate-precommit-diff")
-        _run(("git", "diff", "--cached", "--check"), candidate, evidence, "candidate-precommit-index")
-        _run(("git", "diff", "--name-only", "--diff-filter=U"), candidate, evidence, "candidate-unresolved")
-        _run(("git", "commit", "--no-verify", "--cleanup=verbatim", "--file", str(metadata_dir / "merge-message.txt")), candidate, evidence, "candidate-commit", {"GIT_AUTHOR_NAME": metadata["author_name"], "GIT_AUTHOR_EMAIL": metadata["author_email"], "GIT_COMMITTER_NAME": metadata["committer_name"], "GIT_COMMITTER_EMAIL": metadata["committer_email"], "GIT_AUTHOR_DATE": f"{metadata['author_timestamp']} {metadata['author_offset']}", "GIT_COMMITTER_DATE": f"{metadata['committer_timestamp']} {metadata['committer_offset']}"})
-        candidate_head = _run(("git", "rev-parse", "HEAD"), candidate, evidence, "candidate-head")
-        if candidate_head.stdout.strip():
-            _require_output(candidate_head, MERGE_HEAD, "candidate HEAD")
-        candidate_merge_head = _run(("git", "rev-parse", "MERGE_HEAD"), candidate, evidence, "candidate-merge-head")
-        if candidate_merge_head.stdout.strip():
-            _require_output(candidate_merge_head, MASTER_HEAD, "candidate MERGE_HEAD")
-        raw_result = _run(("git", "cat-file", "commit", "HEAD"), candidate, evidence, "candidate-raw-commit")
-        if raw_result.stdout and raw_result.stdout.encode() != raw:
-            raise ValueError("replayed commit bytes differ")
-        candidate_tree = _run(("git", "write-tree"), candidate, evidence, "candidate-tree")
-        if candidate_tree.stdout.strip():
-            _require_output(candidate_tree, MERGE_TREE, "candidate tree")
-        if (baseline / "environment.yml").exists() and (candidate / "environment.yml").exists() and baseline.joinpath("environment.yml").read_bytes() != candidate.joinpath("environment.yml").read_bytes():
-            raise ValueError("baseline and candidate environment files differ")
-        delta = _run(("git", "diff", "--name-only", MASTER_HEAD, "HEAD"), candidate, evidence, "candidate-delta").stdout.splitlines()
-        if delta and delta != ["tests/test_free_functions.py"]:
-            raise ValueError("candidate source delta changed")
-        _source_record(candidate, evidence, "candidate")
-        if _tracked_digest(candidate) != CANDIDATE_SOURCE_HASH:
-            raise ValueError("candidate source digest mismatch")
-        _run((str(env_prefix / "bin/python"), "-m", "pip", "install", "--no-index", "--no-deps", "--no-build-isolation", "--editable", str(candidate)), neutral, evidence, "candidate-install")
-        runtime = _runtime(neutral, env_prefix, evidence, "candidate", candidate)
-        validate_runtime(runtime, env_prefix, candidate, "candidate")
-        third = _inventory(candidate, env_prefix, evidence, "candidate", "before")
-        _compare_boundaries(second, third, baseline, candidate)
-        _check_phase(candidate, env_prefix, evidence, "candidate", baseline_xml, candidate=True)
-        fourth = _inventory(candidate, env_prefix, evidence, "candidate", "after")
-        _compare_boundaries(third, fourth, candidate, candidate)
+        _exclusive_write(evidence/"run-identity.json",json.dumps({"run_id":os.environ.get("GITHUB_RUN_ID","local"),"attempt":os.environ.get("GITHUB_RUN_ATTEMPT","1"),"payload_sha":os.environ.get("GITHUB_SHA","unknown"),"workflow_ref":os.environ.get("GITHUB_WORKFLOW_REF","local"),"runner_os":os.name},indent=2)+"\n")
+        payload=_run(("git","rev-parse","HEAD"),Path.cwd(),evidence,"payload-head"); _require_output(payload,os.environ.get("GITHUB_SHA",payload.stdout.strip()),"payload HEAD")
+        _run(("git","fetch","--no-tags","--depth=4","origin",PR_HEAD,MASTER_HEAD),candidate,evidence,"fetch-parents")
+        for name,ref in (("pr-parent",PR_HEAD),("master-parent",MASTER_HEAD)):
+            _require_output(_run(("git","rev-parse",f"{ref}^{{commit}}"),candidate,evidence,name),ref,name)
+        _require_output(_run(("git","merge-base",PR_HEAD,MASTER_HEAD),candidate,evidence,"merge-base"),"9a6a705fe73ae94300974a3c668719f907b6353f","merge-base")
+        _run(("git","checkout","--detach",MASTER_HEAD),baseline,evidence,"checkout-baseline")
+        _source_record(baseline,evidence,"baseline-before",MASTER_HEAD,None,BASE_SOURCE_HASH)
+        mamba=os.environ.get("CANDIDATE_MAMBA") or str(task / "miniforge" / "bin" / "mamba"); _copy_required(evidence,metadata_dir,baseline)
+        _run((mamba,"env","create","--yes","--prefix",str(env_prefix),"--file",str(baseline/"environment.yml")),baseline,evidence,"solve-environment")
+        neutral.mkdir(parents=True,exist_ok=True)
+        validate_runtime(_runtime(neutral,env_prefix,evidence,"baseline",baseline),env_prefix,baseline,"baseline")
+        first=_inventory(baseline,env_prefix,evidence,"baseline","before")
+        _check_phase(baseline,env_prefix,evidence,"baseline",evidence/"baseline-pytest.xml")
+        shutil.copyfile(evidence/"baseline.xml",evidence/"baseline-pytest.xml"); validate_xml(evidence/"baseline-pytest.xml")
+        second=_inventory(baseline,env_prefix,evidence,"baseline","after"); _compare_boundaries(first,second,baseline,baseline,evidence,"baseline")
+        _source_record(baseline,evidence,"baseline-after",MASTER_HEAD,None,BASE_SOURCE_HASH)
+        _run(("git","merge","--no-ff","--no-commit","--strategy=ort",MASTER_HEAD),candidate,evidence,"merge-candidate")
+        metadata=json.loads((metadata_dir/"merge-metadata.json").read_text()); raw=(metadata_dir/"merge-commit.raw").read_bytes(); message=(metadata_dir/"merge-message.txt").read_bytes(); validate_merge_metadata(metadata,raw,message)
+        _require_output(_run(("git","rev-parse","HEAD"),candidate,evidence,"candidate-precommit-head"),PR_HEAD,"candidate precommit HEAD")
+        _require_output(_run(("git","rev-parse","MERGE_HEAD"),candidate,evidence,"candidate-precommit-merge-head"),MASTER_HEAD,"candidate precommit MERGE_HEAD")
+        _require_output(_run(("git","diff","--name-only","--diff-filter=U"),candidate,evidence,"candidate-unresolved"),"","candidate unresolved")
+        _require_output(_run(("git","write-tree"),candidate,evidence,"candidate-precommit-tree"),MERGE_TREE,"candidate precommit tree")
+        _run(("git","diff","--check"),candidate,evidence,"candidate-precommit-diff")
+        _run(("git","diff","--cached","--check"),candidate,evidence,"candidate-precommit-index")
+        commit_env={"GIT_AUTHOR_NAME":metadata["author_name"],"GIT_AUTHOR_EMAIL":metadata["author_email"],"GIT_COMMITTER_NAME":metadata["committer_name"],"GIT_COMMITTER_EMAIL":metadata["committer_email"],"GIT_AUTHOR_DATE":f"{metadata['author_timestamp']} {metadata['author_offset']}","GIT_COMMITTER_DATE":f"{metadata['committer_timestamp']} {metadata['committer_offset']}","GIT_CONFIG_NOSYSTEM":"1"}
+        _run(("git","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","--no-verify","--cleanup=verbatim","--file",str(metadata_dir/"merge-message.txt")),candidate,evidence,"candidate-commit",commit_env)
+        _require_output(_run(("git","rev-parse","HEAD"),candidate,evidence,"candidate-head"),MERGE_HEAD,"candidate HEAD")
+        _require_output(_run(("git","rev-parse","HEAD^{tree}"),candidate,evidence,"candidate-tree"),MERGE_TREE,"candidate tree")
+        _run(("git","rev-parse","MERGE_HEAD"),candidate,evidence,"candidate-merge-head-after",check=False)
+        raw_result=_run(("git","cat-file","commit","HEAD"),candidate,evidence,"candidate-raw-commit");
+        if raw_result.stdout.encode()!=raw: raise ValueError("replayed commit bytes differ")
+        delta=_run(("git","diff","--name-only",MASTER_HEAD,"HEAD"),candidate,evidence,"candidate-delta").stdout.splitlines()
+        if delta != ["tests/test_free_functions.py"]: raise ValueError("candidate source delta changed")
+        _source_record(candidate,evidence,"candidate-before-install",MERGE_HEAD,MERGE_TREE,CANDIDATE_SOURCE_HASH)
+        if (baseline/"environment.yml").read_bytes() != (candidate/"environment.yml").read_bytes(): raise ValueError("environment files differ")
+        _run((_tool(env_prefix,"python"),"-m","pip","install","--no-index","--no-deps","--no-build-isolation","--editable",str(candidate)),neutral,evidence,"candidate-install")
+        validate_runtime(_runtime(neutral,env_prefix,evidence,"candidate",candidate),env_prefix,candidate,"candidate")
+        third=_inventory(candidate,env_prefix,evidence,"candidate","before"); _compare_boundaries(second,third,baseline,candidate,evidence,"candidate-install")
+        _check_phase(candidate,env_prefix,evidence,"candidate",evidence/"baseline-pytest.xml",candidate=True)
+        fourth=_inventory(candidate,env_prefix,evidence,"candidate","after"); _compare_boundaries(third,fourth,candidate,candidate,evidence,"candidate-checks")
+        _source_record(candidate,evidence,"candidate-after",MERGE_HEAD,MERGE_TREE,CANDIDATE_SOURCE_HASH); completed=True
     except BaseException as exc:
-        primary = exc
+        primary=exc
     finally:
         try:
-            _inventory(baseline, env_prefix, evidence, "final", "baseline")
-        except BaseException as exc:
-            secondary.append(f"baseline export: {exc}")
-        try:
-            final_candidate_inventory = _inventory(candidate, env_prefix, evidence, "final", "candidate")
-            if primary is None and "fourth" in locals():
-                _compare_boundaries(fourth, final_candidate_inventory, candidate, candidate)
-        except BaseException as exc:
-            secondary.append(f"candidate export: {exc}")
-        try:
-            _exclusive_write(evidence / "secondary-errors.json", json.dumps(secondary, indent=2) + "\n")
-            artifact_manifest(task, evidence / "artifact-manifest.json")
-        except BaseException as exc:
-            secondary.append(f"finalization: {exc}")
-    if primary is not None:
-        raise primary
-    if secondary:
-        raise RuntimeError("secondary finalization failures: " + "; ".join(secondary))
-    return {"evidence": str(evidence), "status": "passed"}
-
+            _inventory(baseline,env_prefix,evidence,"final","baseline")
+        except BaseException as exc: secondary.append({"phase":"final-baseline-export","error":repr(exc)})
+        if completed:
+            try:
+                final_candidate_inventory=_inventory(candidate,env_prefix,evidence,"final","candidate")
+            except BaseException as exc: secondary.append({"phase":"final-candidate-export","error":repr(exc)})
+        _exclusive_write(evidence/"primary-error.json",json.dumps({"error":repr(primary)} if primary else {"error":None},indent=2)+"\n")
+        _exclusive_write(evidence/"secondary-errors.json",json.dumps(secondary,indent=2)+"\n")
+        try: artifact_manifest(evidence,evidence/"artifact-manifest.json")
+        except BaseException as exc: secondary.append({"phase":"manifest","error":repr(exc)})
+    if primary is not None: raise primary
+    if secondary: raise RuntimeError("secondary finalization failures: "+repr(secondary))
+    return {"evidence":str(evidence),"status":"passed"}
 
 if __name__ == "__main__":
     main()
