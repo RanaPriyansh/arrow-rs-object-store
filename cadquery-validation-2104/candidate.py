@@ -385,7 +385,7 @@ def main():
         _require_output(_run(("git","write-tree"),candidate,evidence,"candidate-precommit-tree"),MERGE_TREE,"candidate precommit tree")
         _run(("git","diff","--check"),candidate,evidence,"candidate-precommit-diff")
         _run(("git","diff","--cached","--check"),candidate,evidence,"candidate-precommit-index")
-        commit_env={"GIT_AUTHOR_NAME":metadata["author_name"],"GIT_AUTHOR_EMAIL":metadata["author_email"],"GIT_COMMITTER_NAME":metadata["committer_name"],"GIT_COMMITTER_EMAIL":metadata["committer_email"],"GIT_AUTHOR_DATE":f"{metadata['author_timestamp']} {metadata['author_offset']}","GIT_COMMITTER_DATE":f"{metadata['committer_timestamp']} {metadata['committer_offset']}","GIT_CONFIG_NOSYSTEM":"1"}
+        commit_env={"GIT_AUTHOR_NAME":metadata["author_name"],"GIT_AUTHOR_EMAIL":metadata["author_email"],"GIT_COMMITTER_NAME":metadata["committer_name"],"GIT_COMMITTER_EMAIL":metadata["committer_email"],"GIT_AUTHOR_DATE":f"@{metadata['author_timestamp']} {metadata['author_offset']}","GIT_COMMITTER_DATE":f"@{metadata['committer_timestamp']} {metadata['committer_offset']}","GIT_CONFIG_NOSYSTEM":"1"}
         _run(("git","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","--no-verify","--cleanup=verbatim","--file",str(metadata_dir/"merge-message.txt")),candidate,evidence,"candidate-commit",commit_env)
         _require_output(_run(("git","rev-parse","HEAD"),candidate,evidence,"candidate-head"),MERGE_HEAD,"candidate HEAD")
         _require_output(_run(("git","rev-parse","HEAD^{tree}"),candidate,evidence,"candidate-tree"),MERGE_TREE,"candidate tree")
@@ -416,10 +416,14 @@ def main():
             except BaseException as exc: secondary.append({"phase":"final-candidate-export","error":repr(exc)})
         _exclusive_write(evidence/"primary-error.json",json.dumps({"error":repr(primary)} if primary else {"error":None},indent=2)+"\n")
         for phase, source in (("baseline", baseline), ("candidate", candidate)):
-            coverage = source / ".coverage"
-            if coverage.exists() and coverage.stat().st_size:
-                target = evidence / f"{phase}-coverage-failure.data"
-                if not target.exists(): shutil.copyfile(coverage, target)
+            try:
+                coverage = source / ".coverage"
+                if coverage.exists() and coverage.stat().st_size:
+                    target = evidence / f"{phase}-coverage-failure.data"
+                    if not target.exists(): shutil.copyfile(coverage, target)
+                    if target.stat().st_size == 0: raise ValueError(f"{phase} retained coverage is empty")
+            except BaseException as exc:
+                secondary.append({"phase": f"{phase}-coverage-retention", "error": repr(exc)})
         _exclusive_write(evidence/"secondary-errors.json",json.dumps(secondary,indent=2)+"\n")
         try: artifact_manifest(evidence,evidence/"artifact-manifest.json")
         except BaseException as exc:

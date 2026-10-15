@@ -65,7 +65,9 @@ jobs:
           CANDIDATE_ENV: ${{ runner.temp }}/cadquery-candidate/env
           CANDIDATE_CONDA: ${{ runner.temp }}/cadquery-candidate/miniforge/bin/conda
           CANDIDATE_MAMBA: ${{ runner.temp }}/cadquery-candidate/miniforge/bin/mamba
-          CANDIDATE_CONDA: ${{ runner.temp }}/cadquery-candidate/miniforge/bin/conda
+          MAMBA_ROOT_PREFIX: ${{ runner.temp }}/cadquery-candidate/miniforge
+          CONDA_PKGS_DIRS: ${{ runner.temp }}/cadquery-candidate/conda-pkgs
+          PIP_CACHE_DIR: ${{ runner.temp }}/cadquery-candidate/pip-cache
           CANDIDATE_MINIFORGE_DIR: ${{ runner.temp }}/cadquery-candidate/miniforge-installer
         run: python cadquery-validation-2104/candidate.py
       - name: Upload candidate artifacts
