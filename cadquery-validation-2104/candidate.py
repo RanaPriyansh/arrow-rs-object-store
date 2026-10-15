@@ -25,7 +25,7 @@ ADDED_CASES = {
     "tests.test_free_functions::test_chamfer_method_iterable_edges[0.2-0.96-generator]",
 }
 RAW_SHA256 = "621926d4ac8a2a6f73d5826419cf11dbd5ed31f584f633682b584c7178b630bb"
-MESSAGE_SHA256 = "7cbae2d80f9809d16d29c49eaee0624459a23bc7d409020dd44bf4bc981e79ea"
+MESSAGE_SHA256 = "4f2fc48c495d05bf01d8e2c172bfed19efd2481b5270d40ff9d27c506ecd69be"
 
 def canonical(name):
     return re.sub(r"[-_.]+", "-", name).lower()
@@ -157,6 +157,9 @@ def validate_merge_metadata(metadata, raw, message):
     for key, value in expected.items():
         if metadata.get(key) != value:
             raise ValueError(f"merge metadata mismatch: {key}")
+    for value in (metadata.get("commit"), metadata.get("tree"), metadata.get("first_parent"), metadata.get("second_parent")):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
+            raise ValueError("Git identity must be 40 lowercase hexadecimal characters")
     if hashlib.sha256(raw).hexdigest() != RAW_SHA256 or metadata.get("raw_sha256") != RAW_SHA256:
         raise ValueError("raw commit hash mismatch")
     if hashlib.sha256(message).hexdigest() != MESSAGE_SHA256 or metadata.get("message_sha256") != MESSAGE_SHA256:
@@ -167,7 +170,7 @@ def validate_merge_metadata(metadata, raw, message):
         raw_message = raw.split(b"\n\n", 1)[1]
     except IndexError as exc:
         raise ValueError("raw commit has no message") from exc
-    if raw_message != message and raw_message + b"\n" != message:
+    if raw_message != message:
         raise ValueError("raw commit and message differ")
     prefix = b"tree " + MERGE_TREE.encode() + b"\nparent " + PR_HEAD.encode() + b"\nparent " + MASTER_HEAD.encode() + b"\n"
     if not raw.startswith(prefix):
