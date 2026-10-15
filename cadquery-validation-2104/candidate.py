@@ -377,15 +377,15 @@ def main():
         shutil.copyfile(evidence/"baseline.xml",evidence/"baseline-pytest.xml"); validate_xml(evidence/"baseline-pytest.xml")
         second=_inventory(baseline,env_prefix,evidence,"baseline","after"); _compare_boundaries(first,second,baseline,baseline,evidence,"baseline")
         _source_record(baseline,evidence,"baseline-after",MASTER_HEAD,None,BASE_SOURCE_HASH)
-        _run(("git","merge","--no-ff","--no-commit","--strategy=ort",MASTER_HEAD),candidate,evidence,"merge-candidate")
         metadata=json.loads((metadata_dir/"merge-metadata.json").read_text()); raw=(metadata_dir/"merge-commit.raw").read_bytes(); message=(metadata_dir/"merge-message.txt").read_bytes(); validate_merge_metadata(metadata,raw,message)
+        commit_env={"GIT_AUTHOR_NAME":metadata["author_name"],"GIT_AUTHOR_EMAIL":metadata["author_email"],"GIT_COMMITTER_NAME":metadata["committer_name"],"GIT_COMMITTER_EMAIL":metadata["committer_email"],"GIT_AUTHOR_DATE":f"@{metadata['author_timestamp']} {metadata['author_offset']}","GIT_COMMITTER_DATE":f"@{metadata['committer_timestamp']} {metadata['committer_offset']}","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_NOSYSTEM":"1"}
+        _run(("git","merge","--no-ff","--no-commit","--strategy=ort",MASTER_HEAD),candidate,evidence,"merge-candidate",commit_env)
         _require_output(_run(("git","rev-parse","HEAD"),candidate,evidence,"candidate-precommit-head"),PR_HEAD,"candidate precommit HEAD")
         _require_output(_run(("git","rev-parse","MERGE_HEAD"),candidate,evidence,"candidate-precommit-merge-head"),MASTER_HEAD,"candidate precommit MERGE_HEAD")
         _require_output(_run(("git","diff","--name-only","--diff-filter=U"),candidate,evidence,"candidate-unresolved"),"","candidate unresolved")
         _require_output(_run(("git","write-tree"),candidate,evidence,"candidate-precommit-tree"),MERGE_TREE,"candidate precommit tree")
         _run(("git","diff","--check"),candidate,evidence,"candidate-precommit-diff")
         _run(("git","diff","--cached","--check"),candidate,evidence,"candidate-precommit-index")
-        commit_env={"GIT_AUTHOR_NAME":metadata["author_name"],"GIT_AUTHOR_EMAIL":metadata["author_email"],"GIT_COMMITTER_NAME":metadata["committer_name"],"GIT_COMMITTER_EMAIL":metadata["committer_email"],"GIT_AUTHOR_DATE":f"@{metadata['author_timestamp']} {metadata['author_offset']}","GIT_COMMITTER_DATE":f"@{metadata['committer_timestamp']} {metadata['committer_offset']}","GIT_CONFIG_NOSYSTEM":"1"}
         _run(("git","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","commit","--no-verify","--cleanup=verbatim","--file",str(metadata_dir/"merge-message.txt")),candidate,evidence,"candidate-commit",commit_env)
         _require_output(_run(("git","rev-parse","HEAD"),candidate,evidence,"candidate-head"),MERGE_HEAD,"candidate HEAD")
         _require_output(_run(("git","rev-parse","HEAD^{tree}"),candidate,evidence,"candidate-tree"),MERGE_TREE,"candidate tree")
