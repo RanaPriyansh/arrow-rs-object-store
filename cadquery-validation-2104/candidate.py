@@ -1,11 +1,8 @@
-"""Pure Layer 1 validators for the CadQuery candidate replay.
-
-The execution driver is intentionally deferred until independent review accepts these validators.
-"""
+"""Pure, import-safe Layer 1 validators for the CadQuery replay."""
 import hashlib
-import json
 import re
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 import xml.etree.ElementTree as ET
 
 PR_HEAD = "5dfbf5c89932d9c438ba449e29732a6a56680aae"
@@ -15,29 +12,29 @@ MERGE_TREE = "ffd928a746b4cfaf8a2a27a3b8c7e4111efb05f1"
 BASE_SOURCE_HASH = "054b005f9a3a936e9c47455493a4078bc33fc2c342f69f9d0fa5c6f7ec0689c6"
 CANDIDATE_SOURCE_HASH = "c940a32d7e7009cc5793067c76783969571513087d6c9362cb7fa9c2c36cc29c"
 BLACK_COMMIT = "3395340200a1a3853d0ba52386c62ed4c5772b53"
+BLACK_REPOSITORY = "https://github.com/cadquery/black.git"
 BASELINE_CASES = 901
 BASELINE_SKIPS = 3
+BASELINE_SKIP_IDS = {"tests.test_fig::test_fig", "tests.test_fig::test_fig_free_func", "tests.test_vis::test_screenshot_no_patch"}
 ADDED_CASES = {
     "tests.test_free_functions::test_fillet_method_iterable_edges[list]",
     "tests.test_free_functions::test_fillet_method_iterable_edges[generator]",
-    "tests.test_free_functions::test_chamfer_method_iterable_edges[list-None-0.98]",
-    "tests.test_free_functions::test_chamfer_method_iterable_edges[generator-None-0.98]",
-    "tests.test_free_functions::test_chamfer_method_iterable_edges[list-0.2-0.96]",
-    "tests.test_free_functions::test_chamfer_method_iterable_edges[generator-0.2-0.96]",
+    "tests.test_free_functions::test_chamfer_method_iterable_edges[None-0.98-list]",
+    "tests.test_free_functions::test_chamfer_method_iterable_edges[None-0.98-generator]",
+    "tests.test_free_functions::test_chamfer_method_iterable_edges[0.2-0.96-list]",
+    "tests.test_free_functions::test_chamfer_method_iterable_edges[0.2-0.96-generator]",
 }
-
+RAW_SHA256 = "621926d4ac8a2a6f73d5826419cf11dbd5ed31f584f633682b584c7178b630bb"
+MESSAGE_SHA256 = "7cbae2d80f9809d16d29c49eaee0624459a23bc7d409020dd44bf4bc981e79ea"
 
 def canonical(name):
     return re.sub(r"[-_.]+", "-", name).lower()
 
-
 def pip_origin(record):
-    return record.get("channel") == "pypi" or record.get("subdir") == "pypi" or record.get("build") == "pypi_0"
-
+    return record.get("channel") == "pypi" or record.get("platform") == "pypi" or record.get("build_string") == "pypi_0"
 
 def conda_identity(record):
-    return (canonical(record["name"]), record.get("version"), record.get("build"), record.get("build_number"), record.get("channel"), record.get("subdir"))
-
+    return tuple(record.get(k) for k in ("version", "build_string", "build_number", "channel", "base_url", "platform"))
 
 def conda_owned(records):
     values = {}
@@ -50,56 +47,66 @@ def conda_owned(records):
         values[name] = conda_identity(record)
     return values
 
-
 def explicit_set(text):
     return {line.strip() for line in text.splitlines() if line.strip() and not line.startswith(("#", "@"))}
-
 
 def validate_conda_inventory(baseline_records, candidate_records, baseline_explicit, candidate_explicit):
     before, after = conda_owned(baseline_records), conda_owned(candidate_records)
     if before != after:
-        raise ValueError({"missing": sorted(set(before) - set(after)), "extra": sorted(set(after) - set(before)), "changed": sorted(k for k in set(before) & set(after) if before[k] != after[k])})
+        raise ValueError("conda package identity changed")
     if explicit_set(baseline_explicit) != explicit_set(candidate_explicit):
         raise ValueError("conda explicit URL or hash changed")
     return {"packages": len(before), "pip_origin": sorted(canonical(r["name"]) for r in baseline_records if pip_origin(r)), "explicit": len(explicit_set(baseline_explicit))}
 
-
 def pip_records(document):
-    installed = document.get("installed", document if isinstance(document, list) else [])
+    if not isinstance(document, dict) or not isinstance(document.get("installed"), list):
+        raise ValueError("pip inspect must be an object with installed records")
     result = {}
-    for item in installed:
-        metadata = item.get("metadata", item)
+    for item in document["installed"]:
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict) or not metadata.get("name"):
+            raise ValueError("invalid pip metadata")
         name = canonical(metadata["name"])
         if name in result:
             raise ValueError(f"duplicate pip package: {name}")
-        result[name] = {"version": metadata.get("version"), "direct_url": item.get("direct_url"), "editable": bool(item.get("direct_url", {}).get("dir_info", {}).get("editable"))}
+        result[name] = {"version": metadata.get("version"), "direct_url": item.get("direct_url"), "editable": bool((item.get("direct_url") or {}).get("dir_info", {}).get("editable"))}
     return result
 
+def _editable_path(record, expected):
+    direct_url = record.get("direct_url") or {}
+    if not record["editable"]:
+        raise ValueError("editable installation is required")
+    parsed = urlparse(direct_url.get("url", ""))
+    if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+        raise ValueError("editable source is not a local file URL")
+    actual, expected = Path(unquote(parsed.path)).resolve(), Path(expected).resolve()
+    if not actual.is_absolute() or actual != expected:
+        raise ValueError("editable source path is invalid")
 
 def validate_pip_inventory(baseline_document, candidate_document, baseline_source, candidate_source):
     before, after = pip_records(baseline_document), pip_records(candidate_document)
-    if "cadquery" not in before or "cadquery" not in after:
-        raise ValueError("CadQuery is missing")
-    for name in set(before) | set(after):
-        if name == "cadquery":
-            continue
-        if name not in before or name not in after or before[name]["version"] != after[name]["version"]:
-            raise ValueError(f"pip package changed: {name}")
-    if after["cadquery"]["version"] != before["cadquery"]["version"]:
+    if set(before) != set(after) or "cadquery" not in before:
+        raise ValueError("pip package set changed")
+    for name in before:
+        if name != "cadquery" and (before[name]["version"] != after[name]["version"] or before[name]["direct_url"] != after[name]["direct_url"]):
+            raise ValueError(f"pip package provenance changed: {name}")
+    if before["cadquery"]["version"] != after["cadquery"]["version"]:
         raise ValueError("CadQuery version changed")
-    editable = after["cadquery"]["direct_url"] or {}
-    if not editable.get("dir_info", {}).get("editable") or Path(editable.get("url", "")).resolve() != Path(candidate_source).resolve():
-        raise ValueError("candidate CadQuery editable path is invalid")
-    black = before.get("black", {})
-    commit = (black.get("direct_url") or {}).get("vcs_info", {}).get("commit_id")
-    if commit != BLACK_COMMIT:
-        raise ValueError("Black provenance changed")
+    _editable_path(before["cadquery"], baseline_source)
+    _editable_path(after["cadquery"], candidate_source)
+    for inventory in (before, after):
+        direct_url = (inventory.get("black") or {}).get("direct_url") or {}
+        vcs = direct_url.get("vcs_info") or {}
+        if direct_url.get("url") != BLACK_REPOSITORY or vcs.get("commit_id") != BLACK_COMMIT:
+            raise ValueError("Black provenance changed")
     return {"packages": len(after), "editable_source": str(Path(candidate_source).resolve()), "baseline_source": str(Path(baseline_source).resolve())}
 
-
 def validate_runtime(runtime, env_prefix, source_path, phase):
-    prefix = Path(env_prefix).resolve(); source = Path(source_path).resolve()
-    if Path(runtime["python_executable"]).resolve().parent.parent != prefix:
+    prefix, source = Path(env_prefix).resolve(), Path(source_path).resolve()
+    executable = Path(runtime["python_executable"]).resolve()
+    if Path(runtime["python_prefix"]).resolve() != prefix:
+        raise ValueError("Python prefix is invalid")
+    if not executable.is_relative_to(prefix):
         raise ValueError("Python executable is outside environment")
     if tuple(runtime["python_version"][:2]) < (3, 11):
         raise ValueError("unsupported Python")
@@ -109,33 +116,60 @@ def validate_runtime(runtime, env_prefix, source_path, phase):
         raise ValueError(f"{phase} CadQuery path is invalid")
     if runtime.get("black_commit") != BLACK_COMMIT:
         raise ValueError("Black commit is invalid")
-    return {"phase": phase, "python": str(Path(runtime["python_executable"]).resolve()), "source": str(source)}
-
+    return {"phase": phase, "python": str(executable), "prefix": str(prefix), "source": str(source)}
 
 def testcase_ids(xml_path):
-    root = ET.parse(xml_path).getroot(); suite = root.find("testsuite") or root
+    root = ET.parse(xml_path).getroot()
+    found = root.find("testsuite")
+    suite = found if found is not None else root
     cases = []
     for case in suite.findall("testcase"):
         cases.append({"id": case.attrib.get("classname", "") + "::" + case.attrib.get("name", ""), "skipped": case.find("skipped") is not None, "failed": case.find("failure") is not None, "errored": case.find("error") is not None})
     return suite, cases
 
-
 def validate_xml(xml_path, baseline_xml=None, candidate=False):
-    suite, cases = testcase_ids(xml_path); ids = [x["id"] for x in cases]
-    if len(ids) != len(set(ids)) or any(x["failed"] or x["errored"] for x in cases): raise ValueError("duplicate or failed testcase")
+    suite, cases = testcase_ids(xml_path)
+    ids = [item["id"] for item in cases]
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate testcase")
+    if int(suite.attrib.get("failures", "0")) or int(suite.attrib.get("errors", "0")):
+        raise ValueError("suite reports failures or errors")
+    if any(item["failed"] or item["errored"] for item in cases):
+        raise ValueError("failed testcase")
+    skips = {item["id"] for item in cases if item["skipped"]}
     if not candidate:
-        if len(ids) != BASELINE_CASES or sum(x["skipped"] for x in cases) != BASELINE_SKIPS: raise ValueError("baseline count or skips changed")
-        return {"tests": len(ids), "skips": sum(x["skipped"] for x in cases), "ids": ids}
-    base = validate_xml(baseline_xml, candidate=False); added = set(ids) - set(base["ids"])
-    if set(base["ids"]) - set(ids) or added != ADDED_CASES: raise ValueError("candidate testcase identity mismatch")
-    if any(x["skipped"] for x in cases if x["id"] in added): raise ValueError("new testcase skipped")
-    return {"tests": len(ids), "skips": sum(x["skipped"] for x in cases), "added": sorted(added)}
+        if len(ids) != BASELINE_CASES or skips != BASELINE_SKIP_IDS:
+            raise ValueError("baseline cases or skips changed")
+        return {"tests": len(ids), "skips": len(skips), "ids": ids}
+    base = validate_xml(baseline_xml, candidate=False)
+    added = set(ids) - set(base["ids"])
+    if set(base["ids"]) - set(ids) or added != ADDED_CASES:
+        raise ValueError("candidate testcase identity mismatch")
+    if skips != BASELINE_SKIP_IDS or any(item["skipped"] for item in cases if item["id"] in added):
+        raise ValueError("candidate skip identity changed")
+    return {"tests": len(ids), "skips": len(skips), "added": sorted(added)}
 
+def _git_commit_sha1(raw):
+    return hashlib.sha1(b"commit " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
 
 def validate_merge_metadata(metadata, raw, message):
-    expected = {"commit": MERGE_HEAD, "tree": MERGE_TREE, "first_parent": PR_HEAD, "second_parent": MASTER_HEAD, "author_name": "RanaPriyansh", "author_email": "priyanshrana18@gmail.com", "committer_name": "RanaPriyansh", "committer_email": "priyanshrana18@gmail.com", "author_timestamp": 1792016770, "committer_timestamp": 1792016770}
+    expected = {"commit": MERGE_HEAD, "tree": MERGE_TREE, "first_parent": PR_HEAD, "second_parent": MASTER_HEAD, "author_name": "RanaPriyansh", "author_email": "priyanshrana18@gmail.com", "committer_name": "RanaPriyansh", "committer_email": "priyanshrana18@gmail.com", "author_timestamp": 1792016770, "committer_timestamp": 1792016770, "author_offset": "+0530", "committer_offset": "+0530"}
     for key, value in expected.items():
-        if metadata.get(key) != value: raise ValueError(f"merge metadata mismatch: {key}")
-    if hashlib.sha256(raw).hexdigest() != metadata["raw_sha256"] or hashlib.sha256(message).hexdigest() != metadata["message_sha256"]: raise ValueError("merge metadata hash mismatch")
-    if not raw.startswith(b"tree " + MERGE_TREE.encode() + b"\nparent " + PR_HEAD.encode() + b"\nparent " + MASTER_HEAD.encode() + b"\n"): raise ValueError("merge parent order mismatch")
-    return {"commit": metadata["commit"], "tree": metadata["tree"], "raw_sha256": metadata["raw_sha256"], "message_sha256": metadata["message_sha256"]}
+        if metadata.get(key) != value:
+            raise ValueError(f"merge metadata mismatch: {key}")
+    if hashlib.sha256(raw).hexdigest() != RAW_SHA256 or metadata.get("raw_sha256") != RAW_SHA256:
+        raise ValueError("raw commit hash mismatch")
+    if hashlib.sha256(message).hexdigest() != MESSAGE_SHA256 or metadata.get("message_sha256") != MESSAGE_SHA256:
+        raise ValueError("commit message hash mismatch")
+    if _git_commit_sha1(raw) != MERGE_HEAD:
+        raise ValueError("raw commit identity mismatch")
+    try:
+        raw_message = raw.split(b"\n\n", 1)[1]
+    except IndexError as exc:
+        raise ValueError("raw commit has no message") from exc
+    if raw_message != message and raw_message + b"\n" != message:
+        raise ValueError("raw commit and message differ")
+    prefix = b"tree " + MERGE_TREE.encode() + b"\nparent " + PR_HEAD.encode() + b"\nparent " + MASTER_HEAD.encode() + b"\n"
+    if not raw.startswith(prefix):
+        raise ValueError("merge parent order mismatch")
+    return {"commit": MERGE_HEAD, "tree": MERGE_TREE, "raw_sha256": RAW_SHA256, "message_sha256": MESSAGE_SHA256}
