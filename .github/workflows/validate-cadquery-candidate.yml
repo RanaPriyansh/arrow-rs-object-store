@@ -13,7 +13,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      GITHUB_TOKEN: ${{ github.token }}
       OMP_NUM_THREADS: "1"
       OPENBLAS_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
@@ -30,13 +29,19 @@ jobs:
           ref: 5f5bc62b255f62e3512105740025361b6c31eddd
           path: source
           persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: CadQuery/cadquery
+          ref: 5dfbf5c89932d9c438ba449e29732a6a56680aae
+          path: candidate-source
+          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: "3.11"
       - name: Install checksum-verified Miniforge
         run: |
           set -euo pipefail
-          base="$RUNNER_TEMP/cadquery-candidate-miniforge"
+          base="$RUNNER_TEMP/cadquery-candidate/miniforge-installer"
           mkdir -p "$base"
           curl --fail --location --output "$base/Miniforge.sh" https://github.com/conda-forge/miniforge/releases/download/26.1.1-3/Miniforge3-26.1.1-3-Linux-x86_64.sh
           curl --fail --location --output "$base/Miniforge.sha256" https://github.com/conda-forge/miniforge/releases/download/26.1.1-3/Miniforge3-26.1.1-3-Linux-x86_64.sh.sha256
@@ -51,22 +56,20 @@ jobs:
           python --version
           uname -a
           df -h .
-      - name: Install declared dependencies and run complete candidate
-        working-directory: source
-        run: python ../validation/cadquery-validation-2104/candidate.py
+      - name: Run complete sequential baseline and candidate validation
+        working-directory: validation
+        env:
+          CANDIDATE_TASK_DIR: ${{ runner.temp }}/cadquery-candidate
+          CANDIDATE_BASELINE_SOURCE: ${{ github.workspace }}/source
+          CANDIDATE_SOURCE: ${{ github.workspace }}/candidate-source
+          CANDIDATE_ENV: ${{ runner.temp }}/cadquery-candidate/env
+          CANDIDATE_CONDA: ${{ runner.temp }}/cadquery-candidate/miniforge/bin/conda
+          CANDIDATE_MAMBA: ${{ runner.temp }}/cadquery-candidate/miniforge/bin/mamba
+        run: python cadquery-validation-2104/candidate.py
       - name: Upload candidate artifacts
         if: ${{ always() && !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: cadquery-candidate-linux-2107
-          path: ${{ runner.temp }}/cadquery-candidate/artifacts
+          path: ${{ runner.temp }}/cadquery-candidate/evidence
           if-no-files-found: error
-      - name: Record final source state
-        if: ${{ !cancelled() }}
-        working-directory: source
-        run: |
-          set -euo pipefail
-          git rev-parse HEAD
-          git status --porcelain=v1 --untracked-files=all
-          git diff --check
-          df -h .
