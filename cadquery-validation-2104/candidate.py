@@ -30,6 +30,11 @@ MESSAGE_SHA256 = "4f2fc48c495d05bf01d8e2c172bfed19efd2481b5270d40ff9d27c506ecd69
 def canonical(name):
     return re.sub(r"[-_.]+", "-", name).lower()
 
+def validate_source_digest(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError("source digest must be 64 lowercase hexadecimal characters")
+    return value
+
 def pip_origin(record):
     return record.get("channel") == "pypi" or record.get("platform") == "pypi" or record.get("build_string") == "pypi_0"
 
@@ -153,6 +158,8 @@ def _git_commit_sha1(raw):
     return hashlib.sha1(b"commit " + str(len(raw)).encode() + b"\0" + raw).hexdigest()
 
 def validate_merge_metadata(metadata, raw, message):
+    validate_source_digest(BASE_SOURCE_HASH)
+    validate_source_digest(CANDIDATE_SOURCE_HASH)
     expected = {"commit": MERGE_HEAD, "tree": MERGE_TREE, "first_parent": PR_HEAD, "second_parent": MASTER_HEAD, "author_name": "RanaPriyansh", "author_email": "priyanshrana18@gmail.com", "committer_name": "RanaPriyansh", "committer_email": "priyanshrana18@gmail.com", "author_timestamp": 1792016770, "committer_timestamp": 1792016770, "author_offset": "+0530", "committer_offset": "+0530"}
     for key, value in expected.items():
         if metadata.get(key) != value:
