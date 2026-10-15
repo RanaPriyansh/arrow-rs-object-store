@@ -197,7 +197,7 @@ CHECKS = (
     ("pytest", ("pytest", "-v", "--gui", "--cov")),
 )
 
-RUNTIME_SCRIPT = "import cadquery, OCP, importlib.metadata, json, pathlib, sys; direct=json.loads((pathlib.Path(importlib.metadata.distribution('black')._path)/'direct_url.json').read_text()); print(json.dumps({'python_executable': sys.executable, 'python_prefix': sys.prefix, 'cadquery_path': str(cadquery.__file__), 'ocp_path': str(OCP.__file__), 'python_version': list(sys.version_info[:3]), 'black_version': importlib.metadata.version('black'), 'black_commit': direct['vcs_info']['commit_id']}))"
+RUNTIME_SCRIPT = "import cadquery, OCP, importlib.metadata, json, pathlib, sys; direct=json.loads((pathlib.Path(importlib.metadata.distribution('black')._path)/'direct_url.json').read_text()); versions={name: importlib.metadata.version(name) for name in ('mypy','setuptools','wheel','packaging')}; print(json.dumps({'python_executable': sys.executable, 'python_prefix': sys.prefix, 'cadquery_path': str(cadquery.__file__), 'ocp_path': str(OCP.__file__), 'python_version': list(sys.version_info[:3]), 'black_version': importlib.metadata.version('black'), 'black_commit': direct['vcs_info']['commit_id'], 'tool_versions': versions}))"
 
 def _exclusive_write(path, data):
     path = Path(path)
@@ -229,6 +229,7 @@ def _reserve(evidence_dir, label):
 def _run(command, cwd, evidence_dir, label, env=None, check=True):
     paths, streams = _reserve(evidence_dir, label)
     try:
+        _exclusive_write(evidence_dir / f"{label}.argv.json", json.dumps({"argv": [str(item) for item in command], "cwd": str(Path(cwd).resolve())}, indent=2) + "\n")
         process = subprocess.Popen(command, cwd=str(cwd), env=_safe_env(env), stdout=streams["stdout"], stderr=streams["stderr"], text=True)
         code = process.wait()
     except BaseException:
@@ -244,9 +245,10 @@ def _run(command, cwd, evidence_dir, label, env=None, check=True):
         raise RuntimeError(f"{label} failed with exit {code}")
     return result
 
-def _tracked_digest(source):
+def _tracked_digest(source, evidence_dir, phase):
     source = Path(source)
-    names = subprocess.check_output(("git", "ls-files", "-z"), cwd=str(source)).split(b"\0")
+    result = _run(("git", "ls-files", "-z"), source, evidence_dir, f"{phase}-tracked-files")
+    names = result.stdout.encode().split(b"\0")
     names = names[:-1]
     if len(names) != 219:
         raise ValueError(f"tracked file count changed: {len(names)}")
@@ -270,9 +272,10 @@ def _tool(env_prefix, name):
     return str(path)
 
 def _inventory(source, env_prefix, evidence_dir, phase, suffix):
-    conda = _run((os.environ.get("CANDIDATE_CONDA", _tool(env_prefix, "conda")), "list", "--prefix", str(env_prefix), "--json"), source, evidence_dir, f"{phase}-{suffix}-conda-list")
-    explicit = _run((os.environ.get("CANDIDATE_CONDA", _tool(env_prefix, "conda")), "list", "--prefix", str(env_prefix), "--explicit", "--md5"), source, evidence_dir, f"{phase}-{suffix}-conda-explicit")
-    export = _run((os.environ.get("CANDIDATE_CONDA", _tool(env_prefix, "conda")), "env", "export", "--prefix", str(env_prefix), "--json"), source, evidence_dir, f"{phase}-{suffix}-conda-export")
+    conda_executable = os.environ.get("CANDIDATE_CONDA") or _tool(env_prefix, "conda")
+    conda = _run((conda_executable, "list", "--prefix", str(env_prefix), "--json"), source, evidence_dir, f"{phase}-{suffix}-conda-list")
+    explicit = _run((conda_executable, "list", "--prefix", str(env_prefix), "--explicit", "--md5"), source, evidence_dir, f"{phase}-{suffix}-conda-explicit")
+    export = _run((conda_executable, "env", "export", "--prefix", str(env_prefix), "--json"), source, evidence_dir, f"{phase}-{suffix}-conda-export")
     python = _tool(env_prefix, "python")
     pip = _run((python, "-m", "pip", "inspect"), source, evidence_dir, f"{phase}-{suffix}-pip-inspect")
     freeze = _run((python, "-m", "pip", "freeze", "--all"), source, evidence_dir, f"{phase}-{suffix}-pip-freeze")
@@ -290,7 +293,7 @@ def _source_record(source, evidence_dir, phase, expected_head=None, expected_tre
     head = _run(("git", "rev-parse", "HEAD"), source, evidence_dir, f"{phase}-source-head").stdout
     tree = _run(("git", "rev-parse", "HEAD^{tree}"), source, evidence_dir, f"{phase}-source-tree").stdout
     status = _run(("git", "status", "--porcelain=v1", "--untracked-files=all"), source, evidence_dir, f"{phase}-source-status").stdout
-    digest = _tracked_digest(source)
+    digest = _tracked_digest(source, evidence_dir, phase)
     tracked_status = "\n".join(line for line in status.splitlines() if line and not line.startswith("??"))
     if tracked_status.strip(): raise ValueError(f"{phase} tracked tree is dirty: {tracked_status}")
     if expected_head is not None: _require_output(type("R",(),{"stdout":head})(), expected_head, f"{phase} HEAD")
@@ -305,7 +308,7 @@ def _runtime(neutral, env_prefix, evidence_dir, phase, expected_source):
     runtime=_read_json_output(result,f"{phase} runtime")
     runtime["ocp_record"]=_ocp_record(env_prefix)
     runtime["ocp_version"] = runtime["ocp_record"]["version"]
-    runtime["ocp_path"] = runtime["ocp_path"]
+    runtime["tool_versions"] = runtime.get("tool_versions", {})
     return runtime
 
 def _compare_boundaries(before, after, before_source, after_source, evidence_dir, label):
@@ -342,6 +345,10 @@ def artifact_manifest(root, output):
 
 def _copy_required(evidence, metadata_dir, baseline):
     for src,name in ((baseline/"environment.yml","baseline-environment.yml"),(metadata_dir/"merge-metadata.json","merge-metadata.json"),(metadata_dir/"merge-message.txt","merge-message.txt"),(metadata_dir/"merge-commit.raw","merge-commit.raw")):
+        if not src.exists(): raise FileNotFoundError(src)
+        shutil.copyfile(src,Path(evidence)/name)
+    installer = Path(os.environ.get("CANDIDATE_MINIFORGE_DIR", metadata_dir / "miniforge-installer"))
+    for src,name in ((installer / "Miniforge.sh", "Miniforge.sh"), (installer / "Miniforge.sha256", "Miniforge.sha256")):
         if not src.exists(): raise FileNotFoundError(src)
         shutil.copyfile(src,Path(evidence)/name)
 
@@ -391,10 +398,12 @@ def main():
         if (baseline/"environment.yml").read_bytes() != (candidate/"environment.yml").read_bytes(): raise ValueError("environment files differ")
         _run((_tool(env_prefix,"python"),"-m","pip","install","--no-index","--no-deps","--no-build-isolation","--editable",str(candidate)),neutral,evidence,"candidate-install")
         validate_runtime(_runtime(neutral,env_prefix,evidence,"candidate",candidate),env_prefix,candidate,"candidate")
+        _source_record(candidate,evidence,"candidate-after-install",MERGE_HEAD,MERGE_TREE,CANDIDATE_SOURCE_HASH)
         third=_inventory(candidate,env_prefix,evidence,"candidate","before"); _compare_boundaries(second,third,baseline,candidate,evidence,"candidate-install")
         _check_phase(candidate,env_prefix,evidence,"candidate",evidence/"baseline-pytest.xml",candidate=True)
         fourth=_inventory(candidate,env_prefix,evidence,"candidate","after"); _compare_boundaries(third,fourth,candidate,candidate,evidence,"candidate-checks")
-        _source_record(candidate,evidence,"candidate-after",MERGE_HEAD,MERGE_TREE,CANDIDATE_SOURCE_HASH); completed=True
+        _source_record(baseline,evidence,"baseline-final",MASTER_HEAD,None,BASE_SOURCE_HASH)
+        _source_record(candidate,evidence,"candidate-after-checks",MERGE_HEAD,MERGE_TREE,CANDIDATE_SOURCE_HASH); completed=True
     except BaseException as exc:
         primary=exc
     finally:
@@ -406,9 +415,16 @@ def main():
                 final_candidate_inventory=_inventory(candidate,env_prefix,evidence,"final","candidate")
             except BaseException as exc: secondary.append({"phase":"final-candidate-export","error":repr(exc)})
         _exclusive_write(evidence/"primary-error.json",json.dumps({"error":repr(primary)} if primary else {"error":None},indent=2)+"\n")
+        for phase, source in (("baseline", baseline), ("candidate", candidate)):
+            coverage = source / ".coverage"
+            if coverage.exists() and coverage.stat().st_size:
+                target = evidence / f"{phase}-coverage-failure.data"
+                if not target.exists(): shutil.copyfile(coverage, target)
         _exclusive_write(evidence/"secondary-errors.json",json.dumps(secondary,indent=2)+"\n")
         try: artifact_manifest(evidence,evidence/"artifact-manifest.json")
-        except BaseException as exc: secondary.append({"phase":"manifest","error":repr(exc)})
+        except BaseException as exc:
+            _exclusive_write(evidence/"manifest-error.json", json.dumps({"error":repr(exc)}, indent=2)+"\n")
+            secondary.append({"phase":"manifest","error":repr(exc)})
     if primary is not None: raise primary
     if secondary: raise RuntimeError("secondary finalization failures: "+repr(secondary))
     return {"evidence":str(evidence),"status":"passed"}
