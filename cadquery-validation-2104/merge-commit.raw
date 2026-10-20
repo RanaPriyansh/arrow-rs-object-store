@@ -1,7 +1,7 @@
-tree ffd928a746b4cfaf8a2a27a3b8c7e4111efb05f1
-parent 5dfbf5c89932d9c438ba449e29732a6a56680aae
-parent 5f5bc62b255f62e3512105740025361b6c31eddd
-author RanaPriyansh <priyanshrana18@gmail.com> 1792016770 +0530
-committer RanaPriyansh <priyanshrana18@gmail.com> 1792016770 +0530
+tree 6aacc88d1dd538613cb837ee14cf8b172e8c5390
+parent 2b85056876c75d4380cf821aa4055d44963cccf7
+parent 33361dc1b5b70bc83ce36f1b34a01ca85dfca80a
+author RanaPriyansh <priyanshrana18@gmail.com> 1792503126 +0530
+committer RanaPriyansh <priyanshrana18@gmail.com> 1792503126 +0530
 
-Merge commit '5f5bc62b255f62e3512105740025361b6c31eddd'
+Merge CadQuery master into iterable-edge tests

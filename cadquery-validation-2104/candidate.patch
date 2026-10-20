@@ -1,9 +1,9 @@
 diff --git a/tests/test_free_functions.py b/tests/test_free_functions.py
-index 24f7d87..1a427ad 100644
+index 3802aef..73a1aeb 100644
 --- a/tests/test_free_functions.py
 +++ b/tests/test_free_functions.py
-@@ -1023,6 +1023,43 @@ def test_chamfer():
-     assert r.faces(">Z").Area() < 1
+@@ -1037,6 +1037,43 @@ def test_fillet_chamfer_methods_shape_arg(sel, n):
+     assert len(r1.Edges()) == len(r2.Edges()) == 12 + 3 * n
  
  
 +@pytest.mark.parametrize("edge_input", ["list", "generator"])

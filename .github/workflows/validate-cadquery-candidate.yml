@@ -26,13 +26,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: CadQuery/cadquery
-          ref: 5f5bc62b255f62e3512105740025361b6c31eddd
+          ref: 33361dc1b5b70bc83ce36f1b34a01ca85dfca80a
           path: source
           persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: CadQuery/cadquery
-          ref: 5dfbf5c89932d9c438ba449e29732a6a56680aae
+          ref: 2b85056876c75d4380cf821aa4055d44963cccf7
           path: candidate-source
           persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1

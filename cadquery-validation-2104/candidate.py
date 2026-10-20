@@ -10,15 +10,15 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 import xml.etree.ElementTree as ET
 
-PR_HEAD = "5dfbf5c89932d9c438ba449e29732a6a56680aae"
-MASTER_HEAD = "5f5bc62b255f62e3512105740025361b6c31eddd"
-MERGE_HEAD = "2b85056876c75d4380cf821aa4055d44963cccf7"
-MERGE_TREE = "ffd928a746b4cfaf8a2a27a3b8c7e4111efb05f1"
-BASE_SOURCE_HASH = "054b005f9a3a936e9c47455493a4078bc33fc2c342f69f9d0fa5c6f7ec0689c6"
-CANDIDATE_SOURCE_HASH = "c940a32d7e7009cc5793067c76783969571513087d6c9362cb7fa9c2c36cc29c"
+PR_HEAD = "2b85056876c75d4380cf821aa4055d44963cccf7"
+MASTER_HEAD = "33361dc1b5b70bc83ce36f1b34a01ca85dfca80a"
+MERGE_HEAD = "9cc9cf276b9af838fc3da453167bdbd2f4a82112"
+MERGE_TREE = "6aacc88d1dd538613cb837ee14cf8b172e8c5390"
+BASE_SOURCE_HASH = "68a23be1055b9b3bcd31ba6b9f0aef19e764482216904e7d1e7af6186c51bef5"
+CANDIDATE_SOURCE_HASH = "a65b28a4d9d03e84a4b8d6ced33be726b26cef8e311f3c2bc07d682705fd7879"
 BLACK_COMMIT = "3395340200a1a3853d0ba52386c62ed4c5772b53"
 BLACK_REPOSITORY = "https://github.com/cadquery/black.git"
-BASELINE_CASES = 901
+BASELINE_CASES = 903
 BASELINE_SKIPS = 3
 BASELINE_SKIP_IDS = {"tests.test_fig::test_fig", "tests.test_fig::test_fig_free_func", "tests.test_vis::test_screenshot_no_patch"}
 ADDED_CASES = {
@@ -29,8 +29,14 @@ ADDED_CASES = {
     "tests.test_free_functions::test_chamfer_method_iterable_edges[0.2-0.96-list]",
     "tests.test_free_functions::test_chamfer_method_iterable_edges[0.2-0.96-generator]",
 }
-RAW_SHA256 = "621926d4ac8a2a6f73d5826419cf11dbd5ed31f584f633682b584c7178b630bb"
-MESSAGE_SHA256 = "4f2fc48c495d05bf01d8e2c172bfed19efd2481b5270d40ff9d27c506ecd69be"
+RAW_SHA256 = "ce45dad2bdcc8af3c57c6176642e7252165e422ec5abd7d7c62e43ba8a94de63"
+MESSAGE_SHA256 = "3c18a4429168e2cb34035db9de8c159d0aeee6be07ca81c6be9e1b4e0f0c9b28"
+TEST_CONFLICT_PATH = "tests/test_free_functions.py"
+TEST_CONFLICT_STAGES = {
+    "1": "24f7d87228944f2395b9621992343327c1c778ec",
+    "2": "1a427ad581936285e1ddbf787dec80278bee7d79",
+    "3": "3802aefd86327345d0796ac8fc132af40f35d062",
+}
 
 def canonical(name):
     return re.sub(r"[-_.]+", "-", name).lower()
@@ -165,7 +171,7 @@ def _git_commit_sha1(raw):
 def validate_merge_metadata(metadata, raw, message):
     validate_source_digest(BASE_SOURCE_HASH)
     validate_source_digest(CANDIDATE_SOURCE_HASH)
-    expected = {"commit": MERGE_HEAD, "tree": MERGE_TREE, "first_parent": PR_HEAD, "second_parent": MASTER_HEAD, "author_name": "RanaPriyansh", "author_email": "priyanshrana18@gmail.com", "committer_name": "RanaPriyansh", "committer_email": "priyanshrana18@gmail.com", "author_timestamp": 1792016770, "committer_timestamp": 1792016770, "author_offset": "+0530", "committer_offset": "+0530"}
+    expected = {"commit": MERGE_HEAD, "tree": MERGE_TREE, "first_parent": PR_HEAD, "second_parent": MASTER_HEAD, "author_name": "RanaPriyansh", "author_email": "priyanshrana18@gmail.com", "committer_name": "RanaPriyansh", "committer_email": "priyanshrana18@gmail.com", "author_timestamp": 1792503126, "committer_timestamp": 1792503126, "author_offset": "+0530", "committer_offset": "+0530"}
     for key, value in expected.items():
         if metadata.get(key) != value:
             raise ValueError(f"merge metadata mismatch: {key}")
@@ -188,6 +194,53 @@ def validate_merge_metadata(metadata, raw, message):
     if not raw.startswith(prefix):
         raise ValueError("merge parent order mismatch")
     return {"commit": MERGE_HEAD, "tree": MERGE_TREE, "raw_sha256": RAW_SHA256, "message_sha256": MESSAGE_SHA256}
+
+def _git_blob_sha1(content):
+    header = b"blob " + str(len(content)).encode() + b"\0"
+    return hashlib.sha1(header + content).hexdigest()
+
+def _insertion_block(source, marker):
+    if source.count(marker) != 1:
+        raise ValueError("known insertion marker is missing or duplicated")
+    start = source.index(marker)
+    end = source.index(b"\ndef test_extrude():", start)
+    return start, end, source[start:end].rstrip(b"\n")
+
+def resolve_known_test_insertion(head, merge_head, unmerged_output, stage_blobs):
+    if head != PR_HEAD or merge_head != MASTER_HEAD:
+        raise ValueError("merge parents do not match the approved source pair")
+    entries = []
+    for row in unmerged_output.split(b"\0"):
+        if not row:
+            continue
+        metadata, path = row.split(b"\t", 1)
+        mode, oid, stage = metadata.split()
+        if mode != b"100644":
+            raise ValueError("unmerged file mode differs from the reviewed conflict")
+        entries.append((path.decode(), stage.decode(), oid.decode()))
+    expected = {(TEST_CONFLICT_PATH, stage, oid) for stage, oid in TEST_CONFLICT_STAGES.items()}
+    if len(entries) != 3 or set(entries) != expected or set(stage_blobs) != set(TEST_CONFLICT_STAGES):
+        raise ValueError("unmerged paths or stage blobs differ from the reviewed conflict")
+    for stage, expected_oid in TEST_CONFLICT_STAGES.items():
+        if _git_blob_sha1(stage_blobs[stage]) != expected_oid:
+            raise ValueError(f"stage {stage} blob differs from the reviewed conflict")
+    ours = stage_blobs["2"]
+    theirs = stage_blobs["3"]
+    shape_start, shape_end, shape_block = _insertion_block(theirs, b'@pytest.mark.parametrize("sel, n",')
+    iterable_marker = b'@pytest.mark.parametrize("edge_input", ["list", "generator"])'
+    if ours.count(iterable_marker) != 2:
+        raise ValueError("iterable test insertion differs from the reviewed source")
+    iterable_start = ours.index(iterable_marker)
+    iterable_end = ours.index(b"\ndef test_extrude():", iterable_start)
+    iterable_block = ours[iterable_start:iterable_end].rstrip(b"\n")
+    resolved = ours[:iterable_start] + shape_block + b"\n\n\n" + iterable_block + b"\n\n\n" + ours[iterable_end + 1:]
+    if b"<<<<<<<" in resolved or b"=======" in resolved or b">>>>>>>" in resolved:
+        raise ValueError("resolved source contains conflict markers")
+    if resolved.count(b"test_fillet_chamfer_methods_shape_arg") != 1 or resolved.count(b"test_fillet_method_iterable_edges") != 1 or resolved.count(b"test_chamfer_method_iterable_edges") != 1:
+        raise ValueError("resolved test functions are incomplete")
+    if shape_start < 0 or shape_end <= shape_start:
+        raise ValueError("upstream Shape test block is invalid")
+    return resolved
 
 
 
@@ -365,7 +418,7 @@ def main():
         _run(("git","fetch","--no-tags","--depth=4","origin",PR_HEAD,MASTER_HEAD),candidate,evidence,"fetch-parents")
         for name,ref in (("pr-parent",PR_HEAD),("master-parent",MASTER_HEAD)):
             _require_output(_run(("git","rev-parse",f"{ref}^{{commit}}"),candidate,evidence,name),ref,name)
-        _require_output(_run(("git","merge-base",PR_HEAD,MASTER_HEAD),candidate,evidence,"merge-base"),"9a6a705fe73ae94300974a3c668719f907b6353f","merge-base")
+        _require_output(_run(("git","merge-base",PR_HEAD,MASTER_HEAD),candidate,evidence,"merge-base"),"5f5bc62b255f62e3512105740025361b6c31eddd","merge-base")
         _run(("git","checkout","--detach",MASTER_HEAD),baseline,evidence,"checkout-baseline")
         _source_record(baseline,evidence,"baseline-before",MASTER_HEAD,None,BASE_SOURCE_HASH)
         mamba=os.environ.get("CANDIDATE_MAMBA") or str(task / "miniforge" / "bin" / "mamba"); _copy_required(evidence,metadata_dir,baseline)
@@ -379,7 +432,22 @@ def main():
         _source_record(baseline,evidence,"baseline-after",MASTER_HEAD,None,BASE_SOURCE_HASH)
         metadata=json.loads((metadata_dir/"merge-metadata.json").read_text()); raw=(metadata_dir/"merge-commit.raw").read_bytes(); message=(metadata_dir/"merge-message.txt").read_bytes(); validate_merge_metadata(metadata,raw,message)
         commit_env={"GIT_AUTHOR_NAME":metadata["author_name"],"GIT_AUTHOR_EMAIL":metadata["author_email"],"GIT_COMMITTER_NAME":metadata["committer_name"],"GIT_COMMITTER_EMAIL":metadata["committer_email"],"GIT_AUTHOR_DATE":f"@{metadata['author_timestamp']} {metadata['author_offset']}","GIT_COMMITTER_DATE":f"@{metadata['committer_timestamp']} {metadata['committer_offset']}","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_NOSYSTEM":"1"}
-        _run(("git","merge","--no-ff","--no-commit","--strategy=ort",MASTER_HEAD),candidate,evidence,"merge-candidate",commit_env)
+        merge_result=_run(("git","merge","--no-ff","--no-commit","--strategy=ort",MASTER_HEAD),candidate,evidence,"merge-candidate",commit_env,check=False)
+        if merge_result.returncode != 1:
+            raise ValueError(f"expected the reviewed insertion conflict, got exit {merge_result.returncode}")
+        unmerged=_run(("git","ls-files","-u","-z"),candidate,evidence,"candidate-known-unmerged")
+        stages={}
+        for stage in TEST_CONFLICT_STAGES:
+            blob=_run(("git","show",f":{stage}:{TEST_CONFLICT_PATH}"),candidate,evidence,f"candidate-stage-{stage}")
+            stages[stage]=blob.stdout.encode()
+        resolved=resolve_known_test_insertion(
+            PR_HEAD,
+            _run(("git","rev-parse","MERGE_HEAD"),candidate,evidence,"candidate-merge-head-for-resolution").stdout.strip(),
+            unmerged.stdout.encode(),
+            stages,
+        )
+        (candidate/TEST_CONFLICT_PATH).write_bytes(resolved)
+        _run(("git","add","--",TEST_CONFLICT_PATH),candidate,evidence,"candidate-stage-resolution")
         _require_output(_run(("git","rev-parse","HEAD"),candidate,evidence,"candidate-precommit-head"),PR_HEAD,"candidate precommit HEAD")
         _require_output(_run(("git","rev-parse","MERGE_HEAD"),candidate,evidence,"candidate-precommit-merge-head"),MASTER_HEAD,"candidate precommit MERGE_HEAD")
         _require_output(_run(("git","diff","--name-only","--diff-filter=U"),candidate,evidence,"candidate-unresolved"),"","candidate unresolved")
